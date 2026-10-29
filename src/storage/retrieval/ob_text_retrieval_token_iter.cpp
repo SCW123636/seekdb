@@ -78,6 +78,11 @@ int ObTextRetrievalTokenIter::init(const ObTextRetrievalScanIterParam &iter_para
   } else if (OB_ISNULL(inv_scan_doc_length_col_)) {
     ret = OB_ERR_UNEXPECTED;
   } else if (OB_FAIL(init_calc_exprs_in_relevance_expr())) {
+  }
+
+  // the daat merge reads this mask for every retrieved row, so it is needed even
+  // when the relevance score is not calculated
+  if (OB_FAIL(ret)) {
   } else if (OB_ISNULL(skip_ = sql::to_bit_vector(
                            allocator_->alloc(sql::ObBitVector::memory_size(max_batch_size_))))) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
@@ -302,10 +307,12 @@ int ObTextRetrievalTokenIter::advance_to(const ObDatum &id_datum)
 int ObTextRetrievalTokenIter::update_scan_param(const ObString &token, common::ObArenaAllocator &allocator)
 {
   int ret = OB_SUCCESS;
-  if (OB_UNLIKELY(inv_idx_agg_param_->key_ranges_.count() != 1)) {
+  // the agg scan also carries the token range, and without it the scan param is the template
+  ObTableScanParam &range_param = need_inv_idx_agg() ? *inv_idx_agg_param_ : *inv_idx_scan_param_;
+  if (OB_UNLIKELY(range_param.key_ranges_.count() != 1)) {
     ret = OB_ERR_UNEXPECTED;
   } else {
-    ObNewRange scan_range = inv_idx_agg_param_->key_ranges_.at(0);
+    ObNewRange scan_range = range_param.key_ranges_.at(0);
     ObObj tmp_obj;
     tmp_obj.set_string(ObVarcharType, token);
     tmp_obj.set_meta_type(scan_range.start_key_.get_obj_ptr()->meta_);
@@ -359,6 +366,12 @@ int ObTextRetrievalTokenIter::update_scan_param(const ObString &token, common::O
 int ObTextRetrievalTokenIter::estimate_token_doc_cnt()
 {
   int ret = OB_SUCCESS;
+  if (!need_calc_relevance()) {
+    // no bm25 parameters to estimate without the relevance score
+    token_doc_cnt_calculated_ = true;
+    token_doc_cnt_ = 0;
+    return ret;
+  }
   int64_t logical_row_cnt = 0;
   int64_t physical_row_cnt = 0;
   ObSEArray<ObEstRowCountRecord, 1> est_records;

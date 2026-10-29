@@ -12037,8 +12037,27 @@ int ObLogPlan::prepare_text_retrieval_scan(const ObIArray<ObRawExpr *> &scan_mat
                                                  table_scan->get_text_retrieval_info()))) {
   } else {
     ObTextRetrievalInfo &tr_info = table_scan->get_text_retrieval_info();
-    tr_info.match_expr_ = match_against;
-    tr_info.pushdown_match_filter_ = match_pred;
+    bool relevance_used = true;
+    const bool pure_bool_match = match_pred == match_against
+        || (T_OP_BOOL == match_pred->get_expr_type()
+            && 1 == match_pred->get_param_count()
+            && match_pred->get_param_expr(0) == match_against);
+    // A standalone `WHERE MATCH ... AGAINST ...` predicate is fully answered by the
+    // inverted index scan itself, so the bm25 score and its auxiliary scans can be
+    // elided. An index back is not supported: the lookup path requires the retrieval
+    // iter to project the score column. Boolean mode keeps its original iter choice,
+    // which depends on the projected score.
+    if (!pure_bool_match
+        || table_scan->get_index_back()
+        || NATURAL_LANGUAGE_MODE != match_against->get_mode_flag()) {
+      // keep calculating the score
+    } else if (OB_FAIL(check_relevance_used_as_value(relevance_used))) {
+      LOG_WARN("failed to check whether relevance score is used as a value", K(ret));
+    }
+    tr_info.need_calc_relevance_ = relevance_used;
+    // a pure boolean match is already guaranteed by the retrieval scan itself,
+    // evaluating it again would only add a score dependency
+    tr_info.pushdown_match_filter_ = relevance_used ? match_pred : nullptr;
     // The mapping table is absent when the data-table rowkey is used as the document ID.
     table_scan->set_doc_id_index_table_id(tr_info.doc_id_idx_tid_);
     if (table_scan->is_vec_adaptive_scan() || table_scan->is_vec_idx_scan_post_filter()) {
@@ -12183,8 +12202,6 @@ int ObLogPlan::prepare_text_retrieval_info(const uint64_t ref_table_id,
   uint64_t fwd_idx_tid = OB_INVALID_ID;
   uint64_t inv_idx_tid = OB_INVALID_ID;
   ObSEArray<ObAuxTableMetaInfo, 4> index_infos;
-  bool need_calc_relevance = true;
-  ObSEArray<ObExprConstraint, 2> constraints;
   uint64_t docid_col_id = OB_INVALID_ID;
   if (OB_ISNULL(match_against) || OB_ISNULL(get_stmt()) || OB_ISNULL(get_optimizer_context().get_query_ctx())) {
     ret = OB_INVALID_ARGUMENT;
@@ -12251,18 +12268,6 @@ int ObLogPlan::prepare_text_retrieval_info(const uint64_t ref_table_id,
     }
   }
   if (OB_SUCC(ret)) {
-    /*
-    if (OB_FAIL(ObTransformUtils::check_need_calc_match_score(get_optimizer_context().get_exec_ctx(),
-                                                              get_stmt(),
-                                                              match_against,
-                                                              need_calc_relevance,
-                                                              constraints))) {
-      LOG_WARN("failed to check need calc relevance", K(ret));
-    } else if (!need_calc_relevance &&
-               OB_FAIL(append_array_no_dup(get_optimizer_context().get_query_ctx()->all_expr_constraints_, constraints))) {
-      LOG_WARN("failed to append array no dup", K(ret));
-    }
-    */
     tr_info.match_expr_ = match_against;
     tr_info.inv_idx_tid_ = inv_idx_tid;
     tr_info.fwd_idx_tid_ = fwd_idx_tid;
@@ -12270,7 +12275,36 @@ int ObLogPlan::prepare_text_retrieval_info(const uint64_t ref_table_id,
     tr_info.rowkey_idx_tid_ = rowkey_doc_tid;
     tr_info.data_table_id_ = ref_table_id;
     tr_info.pushdown_match_filter_ = nullptr;
-    tr_info.need_calc_relevance_ = need_calc_relevance;
+    tr_info.need_calc_relevance_ = true;
+  }
+  return ret;
+}
+
+int ObLogPlan::check_relevance_used_as_value(bool &used_as_value) const
+{
+  int ret = OB_SUCCESS;
+  used_as_value = true;
+  const ObDMLStmt *dml_stmt = get_stmt();
+  if (OB_ISNULL(dml_stmt)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (!dml_stmt->is_select_stmt()) {
+    // conservative default for non-select statements
+  } else {
+    const ObSelectStmt *select_stmt = static_cast<const ObSelectStmt *>(dml_stmt);
+    // has_group_by() is also true for a scalar aggregate, which does not need the score
+    used_as_value = select_stmt->has_order_by()
+                    || select_stmt->get_group_expr_size() > 0
+                    || select_stmt->has_having()
+                    || select_stmt->has_window_function()
+                    || select_stmt->has_distinct();
+    for (int64_t i = 0; OB_SUCC(ret) && !used_as_value && i < select_stmt->get_select_item_size(); ++i) {
+      const ObRawExpr *select_expr = select_stmt->get_select_item(i).expr_;
+      if (OB_ISNULL(select_expr)) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (select_expr->has_flag(CNT_MATCH_EXPR)) {
+        used_as_value = true;
+      }
+    }
   }
   return ret;
 }
@@ -12745,6 +12779,8 @@ int ObLogPlan::try_push_topn_into_text_retrieval_scan(ObLogicalOperator *&top,
     pushed_limit_expr = need_further_sort ? topn_expr : limit_expr;
     pushed_offset_expr = need_further_sort ? NULL : offset_expr;
     ObSEArray<OrderItem, 1> tmp_sort_keys;
+    // a pushed down topn orders by the score, so the score must be computed
+    table_scan->get_text_retrieval_info().need_calc_relevance_ = true;
     table_scan->get_text_retrieval_info().topk_limit_expr_ = pushed_limit_expr;
     table_scan->get_text_retrieval_info().topk_offset_expr_ = pushed_offset_expr;
     table_scan->get_text_retrieval_info().sort_key_.expr_ = sort_keys.at(0).expr_;

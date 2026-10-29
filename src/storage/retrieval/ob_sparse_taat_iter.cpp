@@ -405,7 +405,9 @@ int ObSRTaaTIterImpl::load_next_hash_map()
           } else if (OB_FAIL(map->set_refactored(id, cur_relevance + last_relevance, 1 /* overwrite */))) {
           }
         } else {
-          if (OB_FAIL(map->set_refactored(id, 1.0, 0 /* overwrite */))) {
+          // boolean-only retrieval: the doc id itself is the result, a doc matched by
+          // several tokens must not fail the insert
+          if (OB_FAIL(map->set_refactored(id, 1.0, 1 /* overwrite */))) {
           }
         }
       }
