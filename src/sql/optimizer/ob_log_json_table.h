@@ -33,7 +33,8 @@ public:
         access_exprs_(),
         all_cols_def_(),
         table_type_(MulModeTableType::INVALID_TABLE_TYPE),
-        namespace_arr_() {}
+        namespace_arr_(),
+        file_options_() {}
 
   virtual ~ObLogJsonTable() {}
   int add_values_expr(ObIArray<ObRawExpr*> &exprs) { return append(value_exprs_, exprs); }
@@ -56,6 +57,8 @@ public:
                                 ObSqlPlanItem &plan_item) override;
   inline void set_table_type(MulModeTableType table_type) { table_type_ = table_type; }
   inline MulModeTableType get_table_type() { return table_type_; }
+  inline void set_file_options(const common::ObString &file_options) { file_options_ = file_options; }
+  inline const common::ObString &get_file_options() const { return file_options_; }
   int set_namespace_arr(ObIArray<ObString> &namespace_arr);
   int get_namespace_arr(ObIArray<ObString> &namespace_arr);
   int64_t get_ns_size() { return namespace_arr_.count(); }
@@ -73,6 +76,8 @@ private:
   MulModeTableType table_type_;
   // xml table param
   common::ObSEArray<ObString, 16, common::ModulePageAllocator, true> namespace_arr_;
+  // encoded file scan options, only used by file table functions
+  common::ObString file_options_;
   // default value array
   common::ObSEArray<ObColumnDefault, 1, common::ModulePageAllocator, true> column_param_default_exprs_;
 

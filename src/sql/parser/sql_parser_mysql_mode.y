@@ -511,6 +511,7 @@ END_P SET_VAR DELIMITER
 %type <node> column_list_with_boost with_param_column_ref
 %type <node> es_sql_opt
 %type <node> hybrid_search_expr hybrid_search_param
+%type <node> file_table_expr file_table_arg_list file_table_arg
 %type <node> vector_similarity_expr vector_similarity_metric
 %type <node> algorithm_opt lock_opt
 %type <node> flush_privileges_stmt opt_flush_privileges_scope
@@ -10848,6 +10849,10 @@ tbl_name
 {
   $$ = $1;
 }
+| file_table_expr
+{
+  $$ = $1;
+}
 ;
 
 tbl_name:
@@ -17476,6 +17481,45 @@ literal
 | USER_VARIABLE
 {
   $$ = $1;
+}
+;
+
+file_table_expr:
+NAME_OB '(' file_table_arg_list ')'
+{
+  ParseNode *alias_node = NULL;
+  make_name_node(alias_node, result->malloc_pool_, "");
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_EXPRESSION, 3, $1, $3, alias_node);
+}
+| NAME_OB '(' file_table_arg_list ')' relation_name
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_EXPRESSION, 3, $1, $3, $5);
+}
+| NAME_OB '(' file_table_arg_list ')' AS relation_name
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_EXPRESSION, 3, $1, $3, $6);
+}
+;
+
+file_table_arg_list:
+file_table_arg
+{
+  malloc_list_node($$, result->malloc_pool_, T_EXPR_LIST, 2, 1, $1);
+}
+| file_table_arg_list ',' file_table_arg
+{
+  push_back_list(result->malloc_pool_, result, $$, $1, $3);
+}
+;
+
+file_table_arg:
+literal
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_ARG, 2, NULL, $1);
+}
+| NAME_OB COMP_EQ COMP_GT literal
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_ARG, 2, $1, $4);
 }
 ;
 

@@ -10975,5 +10975,18 @@
     "info_cn": "",
     "background_cn": "",
     "ref_url": ""
+  },
+  "enable_file_sql": {
+    "id": 10760,
+    "name": "enable_file_sql",
+    "default_value": "0",
+    "base_value": "0",
+    "data_type": "bool",
+    "info": "enable reading local csv/json/ndjson/parquet files directly in SQL",
+    "flags": "GLOBAL | SESSION",
+    "publish_version": "",
+    "info_cn": "开启后允许通过 read_csv/read_json/read_ndjson/read_parquet/glob 直接查询本地文件",
+    "background_cn": "",
+    "ref_url": ""
   }
 }

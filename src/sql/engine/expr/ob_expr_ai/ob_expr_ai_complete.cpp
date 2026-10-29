@@ -124,17 +124,30 @@ int ObExprAIComplete::eval_ai_complete(const ObExpr &expr,
         ret = OB_INVALID_ARGUMENT;
         LOG_USER_ERROR(OB_INVALID_ARGUMENT, "prompt is not valid");
         res.set_null();
-      } else if (!ObAIFuncJsonUtils::ob_is_json_array_all_str(static_cast<ObJsonArray *>(prompt_object->get_value(ObAIFuncPromptObjectUtils::prompt_args_key)))) {
-        ret = OB_NOT_SUPPORTED;
-        LOG_USER_ERROR(OB_NOT_SUPPORTED, "prompt object is not support");
       } else if (OB_FAIL(ObAIFuncPromptObjectUtils::replace_all_str_args_in_template(temp_allocator, prompt_object, prompt))) {
       }
     } else if (OB_FAIL(ObTextStringHelper::read_real_string_data(ctx.exec_ctx_, temp_allocator, *arg_prompt, expr.args_[1]->datum_meta_, expr.args_[1]->obj_meta_.has_lob_header(), prompt))) {
     }
 
     if (OB_FAIL(ret)) {
-    } else if (OB_NOT_NULL(arg_config)) {
-      if (OB_FAIL(ObTextStringHelper::read_real_string_data(ctx.exec_ctx_, temp_allocator, *arg_config, expr.args_[2]->datum_meta_, expr.args_[2]->obj_meta_.has_lob_header(), config_str))) {
+    } else if (OB_NOT_NULL(arg_config) && !arg_config->is_null()) {
+      ObExpr *arg_expr_config = expr.arg_cnt_ > CONFIG_IDX ? expr.args_[CONFIG_IDX] : nullptr;
+      if (OB_ISNULL(arg_expr_config)) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (arg_expr_config->datum_meta_.type_ == ObJsonType) {
+        ObIJsonBase *j_base = nullptr;
+        bool is_null = false;
+        if (OB_FAIL(ObJsonExprHelper::get_json_doc(expr, ctx, temp_allocator, CONFIG_IDX, j_base, is_null))) {
+        } else if (is_null) {
+        } else if (OB_ISNULL(j_base) || j_base->json_type() != ObJsonNodeType::J_OBJECT) {
+          ret = OB_INVALID_ARGUMENT;
+          LOG_USER_ERROR(OB_INVALID_ARGUMENT, "ai_complete, config must be a json object");
+          res.set_null();
+        } else if (OB_FALSE_IT(config = static_cast<ObJsonObject *>(j_base))) {
+        }
+      } else if (OB_FAIL(ObTextStringHelper::read_real_string_data(ctx.exec_ctx_, temp_allocator, *arg_config, arg_expr_config->datum_meta_, arg_expr_config->obj_meta_.has_lob_header(), config_str))) {
+      } else if (config_str.empty()) {
+        // empty config string is treated as no config
       } else if (OB_FAIL(ObAIFuncJsonUtils::get_json_object_form_str(temp_allocator, config_str, config))) {
       }
     }
@@ -156,6 +169,10 @@ int ObExprAIComplete::eval_ai_complete(const ObExpr &expr,
       ObAIFuncModel model(temp_allocator, *info, *endpoint_info);
       ObString result;
       if (OB_FAIL(model.call_completion(prompt, config, result))) {
+      } else if (result.empty()) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("ai_complete response is empty", K(ret));
+        res.set_null();
       } else if (OB_FAIL(ObAIFuncUtils::set_string_result(expr, ctx, res, result))) {
       }
     }
