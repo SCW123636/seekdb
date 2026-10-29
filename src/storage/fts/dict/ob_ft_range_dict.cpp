@@ -382,18 +382,28 @@ int ObFTRangeDict::find_first_char_range(const ObString &single_word, ObIFTDict 
 {
   int ret = OB_SUCCESS;
   bool found = false;
-  for (int i = 0; OB_SUCC(ret) && !found && i < range_dicts_.size(); ++i) {
+  // Ranges are cut from a sorted dict, so start_ is ascending: binary search for the last range
+  // whose start_ <= word instead of strcmp-ing every range on every char.
+  int64_t low = 0;
+  int64_t high = range_dicts_.size() - 1;
+  while (low <= high) {
+    const int64_t mid = low + ((high - low) >> 1);
     if (ObCharset::strcmp(ObCollationType::CS_TYPE_UTF8MB4_BIN,
-                          range_dicts_[i].start_.get_word(),
+                          range_dicts_[mid].start_.get_word(),
                           single_word)
-            <= 0
-        && ObCharset::strcmp(ObCollationType::CS_TYPE_UTF8MB4_BIN,
-                             range_dicts_[i].end_.get_word(),
-                             single_word)
-               >= 0) {
-      dict = range_dicts_[i].dict_;
-      found = true;
+        <= 0) {
+      low = mid + 1;
+    } else {
+      high = mid - 1;
     }
+  }
+  if (high >= 0
+      && ObCharset::strcmp(ObCollationType::CS_TYPE_UTF8MB4_BIN,
+                           range_dicts_[high].end_.get_word(),
+                           single_word)
+             >= 0) {
+    dict = range_dicts_[high].dict_;
+    found = true;
   }
   if (!found) {
     // not found, dis match

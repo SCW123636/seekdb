@@ -102,10 +102,19 @@ int TokenizeContext::current_char_type(ObFTCharUtil::CharType &type)
 int TokenizeContext::prepare_next_char()
 {
   int ret = OB_SUCCESS;
-  if (OB_FAIL(ObCharset::first_valid_char(coll_type_,
-                                          fulltext_ + cursor_,
-                                          fulltext_len_ - cursor_,
-                                          next_char_len_))) {
+  ob_wc_t unicode = 0;
+  uint8_t fused_len = 0;
+  if (OB_LIKELY(ik_decode_and_classify(coll_type_,
+                                       fulltext_ + cursor_,
+                                       fulltext_len_ - cursor_,
+                                       fused_len,
+                                       unicode,
+                                       next_char_type_))) {
+    next_char_len_ = fused_len;
+  } else if (OB_FAIL(ObCharset::first_valid_char(coll_type_,
+                                                 fulltext_ + cursor_,
+                                                 fulltext_len_ - cursor_,
+                                                 next_char_len_))) {
   } else if (OB_FAIL(ObFTCharUtil::classify_first_char(coll_type_,
                                                        fulltext_ + cursor_,
                                                        next_char_len_,

@@ -499,6 +499,75 @@ inline int ObFTCharUtil::classify_first_char(ObCollationType coll_type,
   return ret;
 }
 
+// Fused single-pass decode + classify for the IK hot loop: the general path decodes the same
+// UTF-8 sequence once per predicate (alpha / arabic / chinese / ...). Only well-formed UTF-8 on
+// an utf8mb4 collation is handled here; anything else makes the caller take the general path.
+OB_INLINE bool ik_decode_and_classify(ObCollationType coll_type,
+                                      const char *input,
+                                      const int64_t remain,
+                                      uint8_t &char_len,
+                                      ob_wc_t &unicode,
+                                      ObFTCharUtil::CharType &type)
+{
+  if (OB_UNLIKELY(CHARSET_UTF8MB4 != ObCharset::charset_type_by_coll(coll_type))) {
+    return false;
+  }
+  const uint8_t *p = reinterpret_cast<const uint8_t *>(input);
+  const uint8_t b0 = p[0];
+  ob_wc_t cp = 0;
+  int64_t len = 0;
+  if (b0 < 0x80) {
+    if (0 == b0) {
+      return false;
+    }
+    cp = b0;
+    len = 1;
+  } else if (b0 >= 0xC2 && b0 <= 0xDF) {
+    if (remain < 2 || 0x80 != (p[1] & 0xC0)) {
+      return false;
+    }
+    cp = ((b0 & 0x1F) << 6) | (p[1] & 0x3F);
+    len = 2;
+  } else if (b0 >= 0xE0 && b0 <= 0xEF) {
+    if (remain < 3 || 0x80 != (p[1] & 0xC0) || 0x80 != (p[2] & 0xC0)) {
+      return false;
+    }
+    cp = ((b0 & 0x0F) << 12) | ((p[1] & 0x3F) << 6) | (p[2] & 0x3F);
+    if (cp < 0x800 || (cp >= 0xD800 && cp <= 0xDFFF)) {
+      return false;
+    }
+    len = 3;
+  } else if (b0 >= 0xF0 && b0 <= 0xF4) {
+    if (remain < 4 || 0x80 != (p[1] & 0xC0) || 0x80 != (p[2] & 0xC0)
+        || 0x80 != (p[3] & 0xC0)) {
+      return false;
+    }
+    cp = ((b0 & 0x07) << 18) | ((p[1] & 0x3F) << 12) | ((p[2] & 0x3F) << 6) | (p[3] & 0x3F);
+    if (cp < 0x10000 || cp > 0x10FFFF) {
+      return false;
+    }
+    len = 4;
+  } else {
+    return false;
+  }
+
+  char_len = static_cast<uint8_t>(len);
+  unicode = cp;
+  // same predicate order as ObFTCharUtil::do_classify
+  if (ObUnicodeBlockUtils::is_alpha(cp)) {
+    type = ObFTCharUtil::CharType::ENGLISH_LETTER;
+  } else if (ObUnicodeBlockUtils::is_arabic(cp)) {
+    type = ObFTCharUtil::CharType::ARABIC_LETTER;
+  } else if (ObUnicodeBlockUtils::is_chinese(cp)) {
+    type = ObFTCharUtil::CharType::CHINESE;
+  } else if (ObUnicodeBlockUtils::is_other_cjk(cp)) {
+    type = ObFTCharUtil::CharType::OTHER_CJK;
+  } else {
+    type = ObFTCharUtil::CharType::USELESS;
+  }
+  return true;
+}
+
 } // namespace storage
 } // namespace oceanbase
 
