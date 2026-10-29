@@ -3769,7 +3769,8 @@ int ObDMLResolver::resolve_file_table_item(const ParseNode &parse_tree, TableIte
       } else if (arg_name.empty()) {
         // positional argument: the file path
         if (got_path) {
-          ret = OB_INVALID_ARGUMENT;
+          // a second positional argument is a syntax error, the format is an option
+          ret = OB_ERR_PARSE_SQL;
           LOG_WARN("file table function accepts only one positional argument", K(ret));
         } else if (OB_FAIL(resolve_str_const(*value_node, arg_value))) {
           LOG_WARN("resolve file path failed", K(ret));
@@ -3955,6 +3956,7 @@ int ObDMLResolver::resolve_file_table_item(const ParseNode &parse_tree, TableIte
       col_def = new (buf) ObDmlJtColDef();
       col_def->table_id_ = item->table_id_;
       col_def->col_base_info_.col_name_ = meta.name_;
+      col_def->col_base_info_.is_nullable_ = meta.nullable_;
       col_def->col_base_info_.col_type_ = COL_TYPE_VALUE;
       col_def->col_base_info_.parent_id_ = 0;
       col_def->col_base_info_.id_ = static_cast<int32_t>(col_id);

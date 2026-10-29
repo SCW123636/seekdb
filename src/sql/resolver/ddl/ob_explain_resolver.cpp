@@ -26,6 +26,108 @@ const static int64_t EXPLAIN_DISPLAY_OPTION = 1;
 const static int64_t EXPLAIN_INTO_TABLE = 2;
 const static int64_t EXPLAIN_STMT_ID = 3;
 const static int64_t EXPLAIN_CHILD_STMT = 4;
+
+namespace
+{
+int push_describe_text(common::ObIAllocator &alloc, const common::ObString &text,
+                       common::ObIArray<common::ObString> &rows)
+{
+  int ret = OB_SUCCESS;
+  ObString copy;
+  if (OB_FAIL(ob_write_string(alloc, text, copy))) {
+  } else if (OB_FAIL(rows.push_back(copy))) {
+  }
+  return ret;
+}
+
+int push_describe_text(common::ObIAllocator &alloc, const char *text,
+                       common::ObIArray<common::ObString> &rows)
+{
+  return push_describe_text(alloc, ObString::make_string(text), rows);
+}
+
+// DuckDB style type name of a file column.
+void file_column_type_name(const ObObjType type, const char *&name)
+{
+  switch (type) {
+    case ObTinyIntType: name = "BOOLEAN"; break;
+    case ObIntType: name = "BIGINT"; break;
+    case ObInt32Type: name = "INTEGER"; break;
+    case ObDoubleType: name = "DOUBLE"; break;
+    case ObFloatType: name = "FLOAT"; break;
+    case ObDateType: name = "DATE"; break;
+    case ObDateTimeType: name = "DATETIME"; break;
+    default: name = "VARCHAR"; break;
+  }
+}
+
+bool file_column_nullable(const ObSelectStmt &select, const ObString &name)
+{
+  bool nullable = false;
+  for (int64_t i = 0; !nullable && i < select.get_table_size(); ++i) {
+    const TableItem *item = select.get_table_item(i);
+    if (NULL != item && TableItem::JSON_TABLE == item->type_ && NULL != item->json_table_def_
+        && !item->json_table_def_->file_options_.empty()) {
+      const ObJsonTableDef *def = item->json_table_def_;
+      // index 0 is the hidden root column
+      for (int64_t c = 1; !nullable && c < def->all_cols_.count(); ++c) {
+        const ObJtColBaseInfo *col = def->all_cols_.at(c);
+        if (NULL != col && ObCharset::case_insensitive_equal(col->col_name_, name)) {
+          nullable = (0 != col->is_nullable_);
+        }
+      }
+    }
+  }
+  return nullable;
+}
+
+// DESCRIBE of a query over file tables prints the inferred schema the way
+// DuckDB does: column_name, column_type, null, key, default, extra.
+int build_file_describe(common::ObIAllocator &alloc, ObDMLStmt *child, ObExplainStmt &explain)
+{
+  int ret = OB_SUCCESS;
+  if (NULL == child || !child->is_select_stmt()) {
+  } else {
+    ObSelectStmt *select = static_cast<ObSelectStmt *>(child);
+    bool has_file_table = false;
+    for (int64_t i = 0; !has_file_table && i < select->get_table_size(); ++i) {
+      const TableItem *item = select->get_table_item(i);
+      if (NULL != item && TableItem::JSON_TABLE == item->type_
+          && NULL != item->json_table_def_ && !item->json_table_def_->file_options_.empty()) {
+        has_file_table = true;
+      }
+    }
+    if (has_file_table && select->get_select_item_size() > 0) {
+      common::ObIArray<common::ObString> &rows = explain.get_describe_rows();
+      for (int64_t i = 0; OB_SUCC(ret) && i < select->get_select_item_size(); ++i) {
+        const SelectItem &item = select->get_select_item(i);
+        ObString name = item.alias_name_;
+        if (name.empty()) {
+          name = item.expr_name_;
+        }
+        if (name.empty() && NULL != item.expr_) {
+          name = item.expr_->get_expr_name();
+        }
+        const char *type_name = NULL;
+        file_column_type_name(NULL == item.expr_ ? ObVarcharType : item.expr_->get_data_type(),
+                              type_name);
+        const char *nullable = file_column_nullable(*select, name) ? "YES" : "NO";
+        ret = push_describe_text(alloc, name, rows);
+        if (OB_SUCC(ret)) { ret = push_describe_text(alloc, type_name, rows); }
+        if (OB_SUCC(ret)) { ret = push_describe_text(alloc, nullable, rows); }
+        for (int64_t c = 0; OB_SUCC(ret) && c < 3; ++c) {
+          ret = push_describe_text(alloc, "NULL", rows);
+        }
+      }
+      if (OB_SUCC(ret)) {
+        explain.set_file_describe(true);
+      }
+    }
+  }
+  return ret;
+}
+} // namespace
+
 int ObExplainResolver::resolve(const ParseNode &parse_tree)
 {
   int ret = OB_SUCCESS;
@@ -64,6 +166,9 @@ int ObExplainResolver::resolve(const ParseNode &parse_tree)
         LOG_WARN("failed to generate stmt for child stmt");
       } else {
         explain_stmt->set_explain_query_stmt(static_cast<ObDMLStmt *>(child_stmt));
+        if (OB_FAIL(build_file_describe(*params_.allocator_, static_cast<ObDMLStmt *>(child_stmt), *explain_stmt))) {
+          LOG_WARN("build file describe failed", K(ret));
+        }
         ParseNode *format = parse_tree.children_[EXPLAIN_FORMAT];
         if (NULL != format) {
           switch (format->type_) {

@@ -117,7 +117,13 @@ int ObExprAIRerank::eval_ai_rerank(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &
   ObDatum *arg_documents = nullptr;
   ObDatum *arg_doc_key = nullptr;
   if (OB_FAIL(expr.eval_param_value(ctx, arg_model_id, arg_query, arg_documents, arg_doc_key))) {
-  } else if (arg_model_id->is_null() || arg_query->is_null() || arg_documents->is_null()) {
+  } else {
+    // a null doc key means the documents are plain strings, not objects;
+    // normalize it here instead of in the if-chain so the main path still runs
+    if (OB_NOT_NULL(arg_doc_key) && (arg_doc_key->is_null() || arg_doc_key->get_string().empty())) {
+      arg_doc_key = nullptr;
+    }
+    if (arg_model_id->is_null() || arg_query->is_null() || arg_documents->is_null()) {
     ret = OB_INVALID_ARGUMENT;
     LOG_USER_ERROR(OB_INVALID_ARGUMENT, "ai_rerank, model id or query or documents is null");
     res.set_null();
@@ -218,6 +224,7 @@ int ObExprAIRerank::eval_ai_rerank(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &
         }
       }
     }
+  }
   }
   return ret;
 }

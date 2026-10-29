@@ -86,7 +86,9 @@ typedef struct ObJtColBaseInfo
     int32_t value_;
     struct {
       int32_t is_name_quoted_ : 1;
-      int32_t reserved_ : 31;
+      // a file table column that can be NULL in the file
+      int32_t is_nullable_ : 1;
+      int32_t reserved_ : 30;
     };
   };
 

@@ -38,7 +38,7 @@ OB_SERIALIZE_MEMBER(ObSelectIntoOpInput, task_id_, sqc_id_);
 OB_SERIALIZE_MEMBER((ObSelectIntoSpec, ObOpSpec), into_type_, user_vars_, outfile_name_,
     field_str_, line_str_, closed_cht_, is_optional_, select_exprs_, is_single_, max_file_size_,
     escaped_cht_, cs_type_, parallel_, buffer_size_, is_overwrite_,
-    external_properties_);
+    external_properties_, header_str_, null_str_);
 
 
 int ObSelectIntoOp::inner_open()
@@ -921,6 +921,14 @@ int ObSelectIntoOp::print_field(const ObObj &obj, ObCsvFileWriter &data_writer)
 {
   int ret = OB_SUCCESS;
   char char_n = 'N';
+  if (obj.is_null() && !MY_SPEC.null_str_.empty()) {
+    // COPY ... (nullstr 'x'): a NULL field is written as the given text
+    ObObj null_text;
+    null_text.set_varchar(MY_SPEC.null_str_);
+    null_text.set_collation_type(cs_type_);
+    OZ(write_obj_to_file(null_text, data_writer, false));
+    return ret;
+  }
   const bool need_enclose = has_enclose_ && !obj.is_null()
                             && (!is_optional_ || obj.is_string_type() || obj.is_collection_sql_type()
                                 || obj.is_json() || obj.is_geometry() || obj.is_date()
@@ -1244,6 +1252,19 @@ int ObSelectIntoOp::create_the_only_data_writer(ObExternalFileWriter *&data_writ
   } else if (ObExternalFileFormat::FormatType::CSV_FORMAT == format_type_ && MY_SPEC.buffer_size_ > 0) {
     csv_data_writer = static_cast<ObCsvFileWriter*>(data_writer);
     if (OB_FAIL(csv_data_writer->alloc_buf(ctx_.get_allocator(), MY_SPEC.buffer_size_))) {
+    }
+  }
+  // COPY ... (header): the column names go before the first row
+  if (OB_SUCC(ret) && ObExternalFileFormat::FormatType::CSV_FORMAT == format_type_
+      && !header_written_ && !MY_SPEC.header_str_.empty()) {
+    if (OB_ISNULL(csv_data_writer)) {
+      csv_data_writer = static_cast<ObCsvFileWriter*>(data_writer);
+    }
+    if (OB_FAIL(csv_data_writer->flush_data(MY_SPEC.header_str_.ptr(),
+                                            MY_SPEC.header_str_.length()))) {
+      LOG_WARN("write csv header failed", K(ret));
+    } else {
+      header_written_ = true;
     }
   }
   return ret;

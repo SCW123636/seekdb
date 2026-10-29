@@ -372,7 +372,7 @@ END_P SET_VAR DELIMITER
         ORGANIZATION
 //-----------------------------non_reserved keyword end---------------------------------------------
 %type <node> sql_stmt stmt_list stmt opt_end_p
-%type <node> select_stmt update_stmt delete_stmt
+%type <node> select_stmt update_stmt delete_stmt copy_to_stmt copy_file_format_list copy_file_format
 %type <node> insert_stmt single_table_insert values_clause dml_table_name
 %type <node> create_table_stmt create_table_like_stmt fork_table_stmt fork_database_stmt diff_table_stmt merge_table_stmt opt_table_option_list table_option_list table_option table_option_list_space_seperated parallel_option lob_storage_clause lob_storage_parameter lob_storage_parameters lob_chunk_size
 %type <node> index_or_heap
@@ -421,6 +421,7 @@ END_P SET_VAR DELIMITER
 %type <node> opt_equal_mark opt_default_mark read_only_or_write not not2
 %type <node> int_or_decimal
 %type <node> opt_column_attribute_list column_attribute column_attribute_list opt_column_default_value opt_column_default_value_list
+%type <node> opt_ai_column_options ai_column_param_list ai_column_param ai_column_param_value
 %type <node> show_stmt from_or_in columns_or_fields database_or_schema index_or_indexes_or_keys opt_from_or_in_database_clause opt_show_condition opt_desc_column_option opt_status opt_storage opt_show_engine check_table_options check_table_option
 %type <node> prepare_stmt stmt_name preparable_stmt
 %type <node> variable_set_stmt var_and_val_list var_and_val to_or_eq set_expr_or_default sys_var_and_val
@@ -583,6 +584,7 @@ stmt:
   | drop_table_stmt         { $$ = $1; check_question_mark($$, result); }
   | drop_view_stmt          { $$ = $1; check_question_mark($$, result); }
   | explain_stmt            { $$ = $1; question_mark_issue($$, result); }
+  | copy_to_stmt            { $$ = $1; question_mark_issue($$, result); }
   | create_outline_stmt     { $$ = $1; question_mark_issue($$, result); }
   | alter_outline_stmt      { $$ = $1; question_mark_issue($$, result); }
   | drop_outline_stmt       { $$ = $1; check_question_mark($$, result); }
@@ -6240,6 +6242,61 @@ not NULLX
 {
   malloc_terminal_node($$, result->malloc_pool_, T_INVISIBLE);
 }
+| AI COLUMN '(' expr ')' opt_ai_column_options
+{
+  dup_expr_string($4, result, @4.first_column, @4.last_column);
+  malloc_non_terminal_node($$, result->malloc_pool_, T_CONSTR_AI_COLUMN, 2, $4, $6);
+}
+;
+
+opt_ai_column_options:
+/* empty */
+{
+  $$ = NULL;
+}
+| WITH '(' ai_column_param_list ')'
+{
+  merge_nodes($$, result, T_AI_COLUMN_PARAMS, $3);
+  dup_expr_string($$, result, @3.first_column, @3.last_column);
+}
+;
+
+ai_column_param_list:
+ai_column_param
+{
+  $$ = $1;
+}
+| ai_column_param_list ',' ai_column_param
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_LINK_NODE, 2, $1, $3);
+}
+;
+
+ai_column_param:
+relation_name COMP_EQ ai_column_param_value
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_AI_COLUMN_PARAM, 2, $1, $3);
+}
+;
+
+ai_column_param_value:
+STRING_VALUE
+{
+  $$ = $1;
+}
+| INTNUM
+{
+  $1->type_ = T_NUMBER;
+  $$ = $1;
+}
+| BOOL_VALUE
+{
+  $$ = $1;
+}
+| relation_name
+{
+  $$ = $1;
+}
 ;
 
 opt_column_default_value_list:
@@ -7277,6 +7334,51 @@ REDUNDANT
   malloc_terminal_node($$, result->malloc_pool_, T_INT);
   $$->value_ = 3;
   $$->is_hidden_const_ = 1;
+}
+;
+
+// COPY (query) TO 'file' (format csv, header, nullstr 'NULL') is the
+// DuckDB spelling of SELECT ... INTO OUTFILE ... FORMAT (...)
+copy_to_stmt:
+COPY '(' select_stmt ')' TO STRING_VALUE '(' copy_file_format_list ')'
+{
+  ParseNode *format_list = NULL;
+  ParseNode *into_node = NULL;
+  merge_nodes(format_list, result, T_EXTERNAL_FILE_FORMAT, $8);
+  malloc_non_terminal_node(into_node, result->malloc_pool_, T_INTO_OUTFILE, 3, $6, format_list, NULL);
+  into_node->value_ = 1; /* mark a copy statement: DuckDB csv defaults */
+  $$ = $3;
+  $$->children_[PARSE_SELECT_INTO_EXTRA] = into_node;
+}
+;
+
+copy_file_format_list:
+copy_file_format
+{
+  $$ = $1;
+}
+| copy_file_format_list ',' copy_file_format
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_LINK_NODE, 2, $1, $3);
+}
+;
+
+copy_file_format:
+FORMAT NAME_OB
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_EXTERNAL_FILE_FORMAT_TYPE, 1, $2);
+}
+| FORMAT STRING_VALUE
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_EXTERNAL_FILE_FORMAT_TYPE, 1, $2);
+}
+| NAME_OB
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_COPY_FILE_OPTION, 2, $1, NULL);
+}
+| NAME_OB STRING_VALUE
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_COPY_FILE_OPTION, 2, $1, $2);
 }
 ;
 
@@ -17517,9 +17619,42 @@ literal
 {
   malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_ARG, 2, NULL, $1);
 }
+| NAME_OB COMP_EQ literal
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_ARG, 2, $1, $3);
+}
+| NAME_OB COMP_EQ '-' INTNUM
+{
+  // file table options accept a negative number, sample_size = -1 for example
+  char num_buf[64];
+  ParseNode *value_node = NULL;
+  snprintf(num_buf, sizeof(num_buf), "-%.*s",
+           (int)($4->str_len_), $4->str_value_);
+  make_name_node(value_node, result->malloc_pool_, num_buf);
+  value_node->type_ = T_VARCHAR;
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_ARG, 2, $1, value_node);
+}
 | NAME_OB COMP_EQ COMP_GT literal
 {
   malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_ARG, 2, $1, $4);
+}
+| FORMAT COMP_EQ literal
+{
+  ParseNode *name_node = NULL;
+  make_name_node(name_node, result->malloc_pool_, "format");
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_ARG, 2, name_node, $3);
+}
+| DELIMITER COMP_EQ literal
+{
+  ParseNode *name_node = NULL;
+  make_name_node(name_node, result->malloc_pool_, "delimiter");
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_ARG, 2, name_node, $3);
+}
+| ESCAPE COMP_EQ literal
+{
+  ParseNode *name_node = NULL;
+  make_name_node(name_node, result->malloc_pool_, "escape");
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_ARG, 2, name_node, $3);
 }
 ;
 

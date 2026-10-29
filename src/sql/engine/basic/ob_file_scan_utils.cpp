@@ -324,7 +324,8 @@ int ObFileScanOptions::set_option(const ObString &key, const ObString &value, bo
       format_ = OB_FILE_FORMAT_CSV;
     } else if (value.case_compare("json") == 0) {
       format_ = OB_FILE_FORMAT_JSON;
-    } else if (value.case_compare("ndjson") == 0 || value.case_compare("jsonl") == 0) {
+    } else if (value.case_compare("ndjson") == 0 || value.case_compare("jsonl") == 0
+               || value.case_compare("newline_delimited") == 0) {
       format_ = OB_FILE_FORMAT_NDJSON;
     } else if (value.case_compare("parquet") == 0) {
       format_ = OB_FILE_FORMAT_PARQUET;
@@ -343,11 +344,11 @@ int ObFileScanOptions::set_option(const ObString &key, const ObString &value, bo
   } else if (key.case_compare("sample_size") == 0) {
     int64_t iv = 0;
     if (!parse_int64_strict(value, iv) || -1 != iv) {
-      ret = OB_INVALID_ARGUMENT;
+      ret = OB_NOT_SUPPORTED;
       char detail[128];
-      snprintf(detail, sizeof(detail), "sample_size is always the whole file, only -1 is accepted (got %.*s)",
+      snprintf(detail, sizeof(detail), "sample_size %.*s (the whole file is always sampled, use -1)",
                value.length(), value.ptr());
-      LOG_USER_ERROR(OB_INVALID_ARGUMENT, detail);
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, detail);
       LOG_WARN("only sample_size = -1 is supported", K(value));
     }
   } else {
@@ -1907,11 +1908,18 @@ int ObFileSchemaInferer::infer(ObIAllocator &alloc,
   ObSEArray<ObString, 64> names;
   ObSEArray<ObObjType, 64> types;
   ObSEArray<int64_t, 64> max_lens;
+  ObSEArray<bool, 64> nullables;
   ObSEArray<ObString, 32> fields;
   ObSEArray<bool, 32> nulls;
   if (OB_FILE_FORMAT_PARQUET == opt.format_) {
     // the schema of a parquet file is stored in its footer and is returned as is
-    return ObParquetReader::read_schema(alloc, path, opt, cols);
+    if (OB_FAIL(ObParquetReader::read_schema(alloc, path, opt, cols))) {
+    } else {
+      for (int64_t i = 0; OB_SUCC(ret) && i < cols.count(); ++i) {
+        static_cast<ObFileColumnMeta &>(cols.at(i)).nullable_ = true;
+      }
+    }
+    return ret;
   }
   if (OB_FAIL(reader.open(path, opt, alloc, tz_ctx))) {
     LOG_WARN("open file failed", K(ret), K(path));
@@ -1938,8 +1946,40 @@ int ObFileSchemaInferer::infer(ObIAllocator &alloc,
           if (OB_SUCC(ret) && OB_FAIL(names.push_back(name))) {
           }
         }
+        // DuckDB style duplicate header naming: id, id__2, id__3, ...
         for (int64_t i = 0; OB_SUCC(ret) && i < names.count(); ++i) {
-          if (OB_FAIL(types.push_back(ObNullType)) || OB_FAIL(max_lens.push_back(0))) {
+          const ObString base = names.at(i);
+          bool duplicated = false;
+          for (int64_t j = 0; !duplicated && j < i; ++j) {
+            duplicated = ObCharset::case_insensitive_equal(names.at(j), base);
+          }
+          if (duplicated) {
+            bool renamed = false;
+            for (int64_t seq = 2; OB_SUCC(ret) && !renamed; ++seq) {
+              char suffix[32];
+              const int64_t suffix_len = snprintf(suffix, sizeof(suffix), "__%ld", static_cast<long>(seq));
+              char *buf = static_cast<char *>(alloc.alloc(base.length() + suffix_len));
+              if (OB_ISNULL(buf)) {
+                ret = OB_ALLOCATE_MEMORY_FAILED;
+              } else {
+                MEMCPY(buf, base.ptr(), base.length());
+                MEMCPY(buf + base.length(), suffix, suffix_len);
+                const ObString candidate(static_cast<int32_t>(base.length() + suffix_len), buf);
+                bool taken = false;
+                for (int64_t j = 0; !taken && j < i; ++j) {
+                  taken = ObCharset::case_insensitive_equal(names.at(j), candidate);
+                }
+                if (!taken) {
+                  names.at(i) = candidate;
+                  renamed = true;
+                }
+              }
+            }
+          }
+        }
+        for (int64_t i = 0; OB_SUCC(ret) && i < names.count(); ++i) {
+          if (OB_FAIL(types.push_back(ObNullType)) || OB_FAIL(max_lens.push_back(0))
+              || OB_FAIL(nullables.push_back(false))) {
           }
         }
       } else {
@@ -1951,7 +1991,8 @@ int ObFileSchemaInferer::infer(ObIAllocator &alloc,
             if (OB_FAIL(ob_write_string(alloc, ObString(static_cast<int32_t>(strlen(nb)), nb), name))) {
             } else if (OB_FAIL(names.push_back(name))
                        || OB_FAIL(types.push_back(ObNullType))
-                       || OB_FAIL(max_lens.push_back(0))) {
+                       || OB_FAIL(max_lens.push_back(0))
+                       || OB_FAIL(nullables.push_back(false))) {
             }
           }
         }
@@ -1968,7 +2009,9 @@ int ObFileSchemaInferer::infer(ObIAllocator &alloc,
         }
         for (int64_t i = 0; OB_SUCC(ret) && i < fields.count(); ++i) {
           const ObString &f = fields.at(i);
-          if (!nulls.at(i)) {
+          if (nulls.at(i)) {
+            nullables.at(i) = true;
+          } else {
             const ObFileValueKind kind = ObFileScanUtils::classify(f, tz_ctx, opt.empty_as_null_);
             types.at(i) = ObFileScanUtils::merge_type(types.at(i), kind);
             if (f.length() > max_lens.at(i)) {
@@ -2029,11 +2072,14 @@ int ObFileSchemaInferer::infer(ObIAllocator &alloc,
             idx = names.count();
             if (OB_FAIL(names.push_back(ObString(keys.at(k).length(), copy)))
                 || OB_FAIL(types.push_back(ObNullType))
-                || OB_FAIL(max_lens.push_back(0))) {
+                || OB_FAIL(max_lens.push_back(0))
+                || OB_FAIL(nullables.push_back(false))) {
               break;
             }
           }
-          if (OB_SUCC(ret) && !value_nulls.at(k)) {
+          if (OB_SUCC(ret) && value_nulls.at(k)) {
+            nullables.at(idx) = true;
+          } else if (OB_SUCC(ret) && !value_nulls.at(k)) {
             const ObString &v = values.at(k);
             const ObFileValueKind kind = ObFileScanUtils::classify(v, tz_ctx, opt.empty_as_null_);
             types.at(idx) = ObFileScanUtils::merge_type(types.at(idx), kind);
@@ -2061,6 +2107,8 @@ int ObFileSchemaInferer::infer(ObIAllocator &alloc,
       meta.type_ = ObVarcharType;
     }
     meta.max_len_ = max_lens.at(i);
+    // a column that is NULL in every row is typed as VARCHAR and is nullable
+    meta.nullable_ = (ObNullType == types.at(i)) || nullables.at(i);
     if (OB_FAIL(cols.push_back(meta))) {
       LOG_WARN("push column failed", K(ret));
     }

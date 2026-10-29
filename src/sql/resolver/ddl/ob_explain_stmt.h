@@ -57,6 +57,11 @@ public:
   virtual bool is_affect_found_rows() const { return is_select_explain(); }
   bool is_explain_extended() const { return EXPLAIN_EXTENDED == format_
                                             || EXPLAIN_EXTENDED_NOADDR == format_; }
+  // DESCRIBE of a query over file tables prints the inferred schema instead of a plan
+  bool is_file_describe() const { return file_describe_; }
+  void set_file_describe(bool file_describe) { file_describe_ = file_describe; }
+  const common::ObIArray<common::ObString> &get_describe_rows() const { return describe_rows_; }
+  common::ObIArray<common::ObString> &get_describe_rows() { return describe_rows_; }
 
   DECLARE_VIRTUAL_TO_STRING;
 private:
@@ -66,6 +71,8 @@ private:
   ObDMLStmt *explain_query_stmt_;
   common::ObString into_table_;
   common::ObString statement_id_;
+  bool file_describe_;
+  common::ObSEArray<common::ObString, 64> describe_rows_;
   DISALLOW_COPY_AND_ASSIGN(ObExplainStmt);
 };
 

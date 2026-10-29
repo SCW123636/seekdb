@@ -2054,7 +2054,135 @@ int ObDDLResolver::resolve_normal_column_attribute_constr_default(ObColumnSchema
   return ret;
 }
 
+// An AI column keeps its generating expression and its options in the column's
+// extended type info: a marker entry, the raw SQL text of the expression and a
+// compact "k=v;k=v" option string. Nothing else in the engine reads those slots
+// for the data types an AI column allows.
+static const char *AI_COLUMN_INFO_MARKER = "__ai_column";
 
+static int resolve_ai_column_options(ParseNode *options_node,
+                                     int64_t &max_retries,
+                                     common::ObString &sync_mode)
+{
+  int ret = OB_SUCCESS;
+  max_retries = 3;
+  sync_mode = common::ObString::make_string("async");
+  for (int64_t i = 0; OB_SUCC(ret) && NULL != options_node && i < options_node->num_child_; ++i) {
+    ParseNode *param = options_node->children_[i];
+    if (NULL == param || T_AI_COLUMN_PARAM != param->type_ || 2 != param->num_child_ ||
+        NULL == param->children_[0] || NULL == param->children_[1]) {
+      ret = OB_ERR_UNEXPECTED;
+    } else {
+      ParseNode *key = param->children_[0];
+      ParseNode *value = param->children_[1];
+      const common::ObString key_str(key->str_len_, key->str_value_);
+      if (0 == key_str.case_compare("sync_mode")) {
+        if (T_VARCHAR != value->type_) {
+          ret = OB_INVALID_ARGUMENT;
+          LOG_USER_ERROR(OB_INVALID_ARGUMENT, "sync_mode of an ai column must be a string");
+        } else {
+          const common::ObString mode(value->str_len_, value->str_value_);
+          if (0 != mode.case_compare("async")) {
+            ret = OB_NOT_SUPPORTED;
+            LOG_USER_ERROR(OB_NOT_SUPPORTED, "ai column sync_mode other than 'async'");
+          }
+        }
+      } else if (0 == key_str.case_compare("max_retries")) {
+        if (T_NUMBER != value->type_ || value->str_len_ <= 0 || value->str_len_ >= 16) {
+          ret = OB_INVALID_ARGUMENT;
+          LOG_USER_ERROR(OB_INVALID_ARGUMENT, "max_retries of an ai column must be an integer");
+        } else {
+          int64_t retries = 0;
+          bool valid_digits = true;
+          for (int32_t j = 0; valid_digits && j < value->str_len_; ++j) {
+            const char c = value->str_value_[j];
+            if (c < '0' || c > '9' || retries > 1000) {
+              valid_digits = false;
+            } else {
+              retries = retries * 10 + (c - '0');
+            }
+          }
+          if (!valid_digits || retries < 0 || retries > 10) {
+            ret = OB_INVALID_ARGUMENT;
+            LOG_USER_ERROR(OB_INVALID_ARGUMENT, "max_retries of an ai column must be within [0, 10]");
+          } else {
+            max_retries = retries;
+          }
+        }
+      } else {
+        ret = OB_INVALID_ARGUMENT;
+        LOG_USER_ERROR(OB_INVALID_ARGUMENT, "unknown ai column option");
+      }
+    }
+  }
+  return ret;
+}
+
+static int resolve_ai_column_attribute(ObColumnSchemaV2 &column, ParseNode &attr)
+{
+  int ret = OB_SUCCESS;
+  ParseNode *expr_node = NULL;
+  ParseNode *options_node = NULL;
+  if (2 != attr.num_child_ || NULL == attr.children_ ||
+      NULL == (expr_node = attr.children_[0])) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (column.is_enum_or_set() || column.is_generated_column()) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "ai column on enum, set or generated column");
+  } else if (T_FUN_SYS != expr_node->type_ || expr_node->num_child_ < 1 ||
+             NULL == expr_node->children_ || NULL == expr_node->children_[0]) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_USER_ERROR(OB_INVALID_ARGUMENT, "ai column expression must call AI_COMPLETE or AI_EMBED");
+  } else {
+    const common::ObString func_name(expr_node->children_[0]->str_len_,
+                                     expr_node->children_[0]->str_value_);
+    const bool is_complete = (0 == func_name.case_compare("ai_complete"));
+    const bool is_embed = (0 == func_name.case_compare("ai_embed"));
+    if (!is_complete && !is_embed) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_USER_ERROR(OB_INVALID_ARGUMENT, "ai column expression must call AI_COMPLETE or AI_EMBED");
+    } else {
+      ParseNode *args = expr_node->num_child_ >= 2 ? expr_node->children_[1] : NULL;
+      if (NULL == args || T_EXPR_LIST != args->type_ || args->num_child_ < 2 ||
+          NULL == args->children_[0]) {
+        ret = OB_INVALID_ARGUMENT;
+        LOG_USER_ERROR(OB_INVALID_ARGUMENT,
+                       "an ai column function needs a model name and an input expression");
+      } else if (T_VARCHAR != args->children_[0]->type_) {
+        ret = OB_INVALID_ARGUMENT;
+        LOG_USER_ERROR(OB_INVALID_ARGUMENT, "the ai model name of an ai column must be a string");
+      } else {
+        int64_t max_retries = 3;
+        common::ObString sync_mode;
+        options_node = attr.children_[1];
+        if (OB_FAIL(resolve_ai_column_options(options_node, max_retries, sync_mode))) {
+        } else if (expr_node->str_len_ <= 0 || NULL == expr_node->str_value_) {
+          ret = OB_ERR_UNEXPECTED;
+        } else if (OB_FAIL(column.add_type_info(
+                     common::ObString::make_string(AI_COLUMN_INFO_MARKER)))) {
+        } else if (OB_FAIL(column.add_type_info(
+                     common::ObString(expr_node->str_len_, expr_node->str_value_)))) {
+        } else {
+          char options_buf[64];
+          const int64_t options_len = snprintf(options_buf, sizeof(options_buf),
+                                               "sync_mode=%.*s;max_retries=%ld",
+                                               sync_mode.length(), sync_mode.ptr(),
+                                               max_retries);
+          if (OB_UNLIKELY(options_len <= 0 || options_len >= static_cast<int64_t>(sizeof(options_buf)))) {
+            ret = OB_ERR_UNEXPECTED;
+          } else if (OB_FAIL(column.add_type_info(
+                       common::ObString(static_cast<int32_t>(options_len), options_buf)))) {
+          } else {
+            column.add_column_flag(AI_COLUMN_FLAG);
+            LOG_INFO("resolve ai column", "column", column.get_column_name(), K(func_name),
+                     K(max_retries), K(sync_mode));
+          }
+        }
+      }
+    }
+  }
+  return ret;
+}
 
 int ObDDLResolver::resolve_normal_column_attribute(ObColumnSchemaV2 &column,
                                                    ParseNode *attrs_node,
@@ -2251,6 +2379,11 @@ int ObDDLResolver::resolve_normal_column_attribute(ObColumnSchemaV2 &column,
       }
       case T_CONSTR_SRID: {
         if (OB_FAIL(resolve_srid_node(column, *attr_node))) {
+        }
+        break;
+      }
+      case T_CONSTR_AI_COLUMN: {
+        if (OB_FAIL(resolve_ai_column_attribute(column, *attr_node))) {
         }
         break;
       }

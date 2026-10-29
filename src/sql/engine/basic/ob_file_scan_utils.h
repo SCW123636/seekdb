@@ -95,11 +95,13 @@ enum ObFileValueKind
 
 struct ObFileColumnMeta
 {
-  ObFileColumnMeta() : name_(), type_(ObNullType), max_len_(0) {}
+  ObFileColumnMeta() : name_(), type_(ObNullType), max_len_(0), nullable_(false) {}
   common::ObString name_;
   ObObjType type_;
   int64_t max_len_;
-  TO_STRING_KV(K_(name), K_(type), K_(max_len));
+  // true when any record holds a NULL (or empty) value for the column
+  bool nullable_;
+  TO_STRING_KV(K_(name), K_(type), K_(max_len), K_(nullable));
 };
 
 // Streaming reader for local files. At most one record (bounded by

@@ -2986,6 +2986,59 @@ int ObSelectResolver::resolve_into_file_node(const ParseNode *list_node, ObSelec
   return ret;
 }
 
+namespace
+{
+int resolve_copy_file_option(const ParseNode &node, ObIAllocator &alloc,
+                             ObSelectIntoItem &into_item)
+{
+  int ret = OB_SUCCESS;
+  if (2 != node.num_child_ || OB_ISNULL(node.children_[0])) {
+    ret = OB_ERR_UNEXPECTED;
+  } else {
+    const ObString name(node.children_[0]->str_len_, node.children_[0]->str_value_);
+    const ParseNode *value = node.children_[1];
+    if (name.case_compare("header") == 0) {
+      into_item.header_ = true;
+    } else if (name.case_compare("nullstr") == 0 || name.case_compare("null_str") == 0) {
+      if (NULL == value) {
+        ret = OB_INVALID_ARGUMENT;
+        LOG_USER_ERROR(OB_INVALID_ARGUMENT, "nullstr needs a value");
+      } else {
+        ObString text(value->str_len_, value->str_value_);
+        ret = ob_write_string(alloc, text, into_item.null_str_);
+      }
+    } else {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "this copy option");
+      LOG_WARN("unknown copy option", K(ret), K(name));
+    }
+  }
+  return ret;
+}
+
+int build_copy_header(const ObSelectStmt &stmt, ObIAllocator &alloc, ObSelectIntoItem &into_item)
+{
+  int ret = OB_SUCCESS;
+  ObSqlString header;
+  const ObString field_term = into_item.field_str_.get_varchar();
+  for (int64_t i = 0; OB_SUCC(ret) && i < stmt.get_select_item_size(); ++i) {
+    const SelectItem &item = stmt.get_select_item(i);
+    const ObString name = item.alias_name_.empty() ? item.expr_name_ : item.alias_name_;
+    if (i > 0 && OB_FAIL(header.append(field_term.ptr(), field_term.length()))) {
+    } else if (OB_SUCC(ret) && OB_FAIL(header.append(name.ptr(), name.length()))) {
+    }
+  }
+  const ObString line_term = into_item.line_str_.get_varchar();
+  if (OB_SUCC(ret)
+      && OB_FAIL(header.append(line_term.ptr(), line_term.length()))) {
+  } else if (OB_SUCC(ret)
+             && OB_FAIL(ob_write_string(alloc, ObString(header.length(), header.ptr()),
+                                        into_item.header_str_))) {
+  }
+  return ret;
+}
+} // namespace
+
 int ObSelectResolver::resolve_into_outfile_with_format(const ParseNode *node, ObSelectIntoItem &into_item)
 {
   int ret = OB_SUCCESS;
@@ -3029,11 +3082,24 @@ int ObSelectResolver::resolve_into_outfile_with_format(const ParseNode *node, Ob
         ret = OB_ERR_UNEXPECTED;
       } else if (T_EXTERNAL_FILE_FORMAT_TYPE == option_node->type_
                  || T_CHARSET == option_node->type_) {
+      } else if (T_COPY_FILE_OPTION == option_node->type_) {
+        if (OB_FAIL(resolve_copy_file_option(*option_node, *allocator_, into_item))) {
+        }
       } else if (OB_FAIL(ObResolverUtils::resolve_file_format(option_node, external_format, params_))) {
       }
     }
+    if (OB_SUCC(ret) && 1 == node->value_) {
+      // copy follows the DuckDB csv dialect, comma separated by default
+      external_format.csv_format_.field_term_str_ = ObString::make_string(",");
+    }
     if (OB_SUCC(ret)
         && OB_FAIL(external_format.to_string_with_alloc(into_item.external_properties_, *allocator_, true))) {
+    } else if (OB_SUCC(ret)) {
+      // the header is printed with the terminators of this format
+      into_item.field_str_.set_varchar(external_format.csv_format_.field_term_str_);
+      into_item.field_str_.set_collation_type(ObCharset::get_system_collation());
+      into_item.line_str_.set_varchar(external_format.csv_format_.line_term_str_);
+      into_item.line_str_.set_collation_type(ObCharset::get_system_collation());
     }
   }
   // file: single, max_file_size, buffer_size
@@ -3128,6 +3194,11 @@ int ObSelectResolver::resolve_into_clause(const ParseNode *node)
         }
       } else {
         //do nothing
+      }
+      if (OB_SUCC(ret) && into_item->header_) {
+        if (OB_FAIL(build_copy_header(*select_stmt, *allocator_, *into_item))) {
+          LOG_WARN("build copy header failed", K(ret));
+        }
       }
       if (OB_SUCC(ret)) {
         select_stmt->set_select_into(into_item);

@@ -46,6 +46,34 @@ int ObExplainLogPlan::generate_normal_raw_plan()
     const ObExplainStmt *explain_stmt = static_cast<const ObExplainStmt*>(get_stmt());
     if (OB_ISNULL(child_stmt = explain_stmt->get_explain_query_stmt())) {
       ret = OB_ERR_UNEXPECTED;
+    } else if (explain_stmt->is_file_describe()) {
+      // DESCRIBE over file tables: the rows are the inferred schema, prepared while resolving
+      if (OB_FAIL(allocate_values_as_top(top))) {
+      } else if (OB_ISNULL(top) || OB_UNLIKELY(LOG_VALUES != top->get_type())) {
+        ret = OB_ERR_UNEXPECTED;
+      } else {
+        set_plan_root(top);
+        top->mark_is_plan_root();
+        values_op = static_cast<ObLogValues*>(top);
+        const ObIArray<ObString> &rows = explain_stmt->get_describe_rows();
+        for (int64_t r = 0; OB_SUCC(ret) && r + 6 <= rows.count(); r += 6) {
+          ObObj cells[6];
+          for (int64_t c = 0; c < 6; ++c) {
+            cells[c].set_varchar(rows.at(r + c));
+            cells[c].set_collation_type(ObCharset::get_system_collation());
+          }
+          ObNewRow row;
+          row.cells_ = cells;
+          row.count_ = 6;
+          if (OB_FAIL(values_op->add_row(row))) {
+          }
+        }
+        if (OB_SUCC(ret)) {
+          values_op->set_op_id(0);
+          set_max_op_id(1);
+        }
+        optimizer_context_.set_packed(false);
+      }
     } else if (OB_ISNULL(child_plan = optimizer_context_.get_log_plan_factory().
                          create(optimizer_context_, *child_stmt))) {
       ret = OB_ALLOCATE_MEMORY_FAILED;
@@ -99,11 +127,16 @@ int ObExplainLogPlan::generate_normal_raw_plan()
     }
     get_optimizer_context().get_all_exprs().reuse();
     if (OB_FAIL(ret)) {
-    } else if (OB_FAIL(allocate_output_expr_for_values_op(*values_op))) {
     } else {
-      get_optimizer_context().set_plan_type(ObPhyPlanType::OB_PHY_PLAN_LOCAL,
-                                            ObPhyPlanType::OB_PHY_PLAN_LOCAL,
-                                            false);
+      const int64_t output_cnt = explain_stmt->is_file_describe() ? 6 : 1;
+      for (int64_t i = 0; OB_SUCC(ret) && i < output_cnt; ++i) {
+        ret = allocate_output_expr_for_values_op(*values_op);
+      }
+      if (OB_SUCC(ret)) {
+        get_optimizer_context().set_plan_type(ObPhyPlanType::OB_PHY_PLAN_LOCAL,
+                                              ObPhyPlanType::OB_PHY_PLAN_LOCAL,
+                                              false);
+      }
     }
   }
   return ret;
