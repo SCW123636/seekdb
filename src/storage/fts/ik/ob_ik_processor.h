@@ -47,6 +47,7 @@ public:
 
   int current_char(const char *&ch, uint8_t &char_len);
   int current_char_type(ObFTCharUtil::CharType &type);
+  ob_wc_t current_char_wc() const { return next_char_wc_; }
 
   int step_next();
 
@@ -82,6 +83,7 @@ private:
 
   int64_t cursor_;
   int64_t next_char_len_;
+  ob_wc_t next_char_wc_;
   ObFTCharUtil::CharType next_char_type_;
 
   uint32_t handle_size_;
@@ -101,7 +103,13 @@ public:
 
   virtual ~ObIIKProcessor() {}
 
-  int process(TokenizeContext &ctx);
+  int process(TokenizeContext &ctx,
+              const char *ch,
+              const uint8_t char_len,
+              const ObFTCharUtil::CharType type)
+  {
+    return do_process(ctx, ch, char_len, type);
+  }
 
   virtual int do_process(TokenizeContext &ctx,
                          const char *ch,
