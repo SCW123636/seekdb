@@ -35,6 +35,96 @@ namespace oceanbase
 namespace storage
 {
 
+namespace
+{
+const int64_t FT_PROP_MEMO_JSON_LEN = 512;
+const int64_t FT_PROP_MEMO_TABLE_CNT = 3;
+
+// One (parser, properties json) pair always parses to the same config, but a
+// helper is rebuilt for every tokenize() call and every MATCH scan, so remember
+// the last parse on the calling thread instead of rebuilding the json tree.
+// The table names parsed out of the json point into the caller's buffer, they
+// are stored as offsets and rebased onto our own copy of that buffer.
+struct ObFTPropMemo
+{
+  bool match(const ObFTParser &parser, const common::ObString &json_str) const
+  {
+    const ObFTParserName &name = parser.get_parser_name();
+    return is_valid_
+        && version_ == parser.get_parser_version()
+        && name_len_ == name.len()
+        && (0 == name_len_ || 0 == MEMCMP(name_, name.str(), name_len_))
+        && json_len_ == json_str.length()
+        && (0 == json_len_ || 0 == MEMCMP(json_, json_str.ptr(), json_len_));
+  }
+  void apply(ObFTParserProperty &property) const
+  {
+    property = property_;
+    if (table_in_json_[0]) {
+      property.stopword_table_ = ObString(table_len_[0], json_ + table_off_[0]);
+    }
+    if (table_in_json_[1]) {
+      property.dict_table_ = ObString(table_len_[1], json_ + table_off_[1]);
+    }
+    if (table_in_json_[2]) {
+      property.quantifier_table_ = ObString(table_len_[2], json_ + table_off_[2]);
+    }
+  }
+  bool store(const ObFTParser &parser,
+             const common::ObString &json_str,
+             const ObFTParserProperty &property)
+  {
+    is_valid_ = false;
+    const ObFTParserName &name = parser.get_parser_name();
+    if (name.len() > OB_FT_PARSER_NAME_LENGTH || json_str.length() > FT_PROP_MEMO_JSON_LEN) {
+      return false;
+    }
+    const common::ObString *tables[FT_PROP_MEMO_TABLE_CNT] = {
+        &property.stopword_table_, &property.dict_table_, &property.quantifier_table_};
+    for (int64_t i = 0; i < FT_PROP_MEMO_TABLE_CNT; ++i) {
+      table_in_json_[i] = false;
+      table_off_[i] = 0;
+      table_len_[i] = 0;
+      if (!tables[i]->empty() && !json_str.empty()) {
+        const int64_t offset = tables[i]->ptr() - json_str.ptr();
+        // Table names that live inside the caller's json buffer are rebased onto
+        // our copy; anything else is a literal and is kept as it is.
+        if (offset >= 0 && offset <= json_str.length()
+            && tables[i]->length() <= json_str.length() - offset) {
+          table_in_json_[i] = true;
+          table_off_[i] = offset;
+          table_len_[i] = tables[i]->length();
+        }
+      }
+    }
+    name_len_ = name.len();
+    json_len_ = json_str.length();
+    version_ = parser.get_parser_version();
+    MEMCPY(name_, name.str(), name_len_);
+    if (json_len_ > 0) {
+      MEMCPY(json_, json_str.ptr(), json_len_);
+    }
+    property_ = property;
+    is_valid_ = true;
+    return true;
+  }
+
+private:
+  ObFTParserProperty property_;
+  int64_t name_len_ = 0;
+  int64_t json_len_ = 0;
+  int64_t version_ = -1;
+  bool is_valid_ = false;
+  bool table_in_json_[FT_PROP_MEMO_TABLE_CNT] = {false, false, false};
+  int64_t table_off_[FT_PROP_MEMO_TABLE_CNT] = {0, 0, 0};
+  int64_t table_len_[FT_PROP_MEMO_TABLE_CNT] = {0, 0, 0};
+  char name_[OB_FT_PARSER_NAME_LENGTH] = {0};
+  char json_[FT_PROP_MEMO_JSON_LEN] = {0};
+};
+
+thread_local ObFTPropMemo g_ft_prop_memo;
+} // namespace
+
 
 int ObFTParserJsonProps::init()
 {
@@ -1016,6 +1106,10 @@ int ObFTParserJsonProps::show_parser_properties(const ObFTParserJsonProps &prope
 int ObFTParserProperty::parse_for_parser_helper(const ObFTParser &parser, const ObString &json_str)
 {
   int ret = OB_SUCCESS;
+  if (g_ft_prop_memo.match(parser, json_str)) {
+    g_ft_prop_memo.apply(*this);
+    return ret;
+  }
   ObFTParserJsonProps props;
   if (OB_FAIL(props.init())) {
   } else if (OB_FAIL(props.parse_from_valid_str(json_str))) {
@@ -1063,6 +1157,9 @@ int ObFTParserProperty::parse_for_parser_helper(const ObFTParser &parser, const 
       } else if (OB_FAIL(props.config_get_max_ngram_token_size(max_ngram_token_size_))) {
       }
     }
+  }
+  if (OB_SUCC(ret)) {
+    g_ft_prop_memo.store(parser, json_str, *this);
   }
   return ret;
 }

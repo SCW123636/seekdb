@@ -22,7 +22,9 @@
 
 #include "common/json_type/ob_json_tree.h"
 #include "share/ob_force_print_log.h"
+#include "storage/fts/dict/ob_ft_cache_container.h"
 #include "storage/fts/dict/ob_ft_dict_hub.h"
+#include "storage/fts/dict/ob_ft_range_dict.h"
 #include "storage/fts/ob_beng_ft_parser.h"
 #include "storage/fts/ob_ik_ft_parser.h"
 #include "storage/fts/ob_ngram2_ft_parser.h"
@@ -231,6 +233,25 @@ void ObFTParseData::destroy()
     stop_word_checker_ = nullptr;
   }
 
+  // Release the dicts before their cache range containers, the dicts point at
+  // the pinned DAT blocks owned by the containers.
+  if (OB_NOT_NULL(ik_dict_main_)) {
+    OB_DELETEx(ObIFTDict, &handler_allocator_, ik_dict_main_);
+    ik_dict_main_ = nullptr;
+  }
+  if (OB_NOT_NULL(ik_dict_quan_)) {
+    OB_DELETEx(ObIFTDict, &handler_allocator_, ik_dict_quan_);
+    ik_dict_quan_ = nullptr;
+  }
+  if (OB_NOT_NULL(ik_container_main_)) {
+    OB_DELETEx(ObFTCacheRangeContainer, &handler_allocator_, ik_container_main_);
+    ik_container_main_ = nullptr;
+  }
+  if (OB_NOT_NULL(ik_container_quan_)) {
+    OB_DELETEx(ObFTCacheRangeContainer, &handler_allocator_, ik_container_quan_);
+    ik_container_quan_ = nullptr;
+  }
+
   if (!OB_ISNULL(dict_hub_)) {
     dict_hub_->destroy();
     dict_hub_->~ObFTDictHub();
@@ -249,6 +270,106 @@ int ObFTParseData::get_dict_hub(ObFTDictHub *&hub)
     ret = OB_NOT_INIT;
   } else {
     hub = dict_hub_;
+  }
+  return ret;
+}
+
+int ObFTParseData::get_ik_dicts(ObIFTDict *&dict_main, ObIFTDict *&dict_quan)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(dict_hub_)) {
+    ret = OB_NOT_INIT;
+  } else if (OB_NOT_NULL(ik_dict_main_) && OB_NOT_NULL(ik_dict_quan_)) {
+    dict_main = ik_dict_main_;
+    dict_quan = ik_dict_quan_;
+  } else {
+    ObLockGuard<common::ObSpinLock> guard(ik_dict_lock_);
+    if (OB_NOT_NULL(ik_dict_main_) && OB_NOT_NULL(ik_dict_quan_)) {
+      dict_main = ik_dict_main_;
+      dict_quan = ik_dict_quan_;
+    } else if (OB_FAIL(build_ik_dicts(dict_main, dict_quan))) {
+      LOG_WARN("failed to build shared ik dicts", K(ret));
+    }
+  }
+  return ret;
+}
+
+int ObFTParseData::build_ik_dicts(ObIFTDict *&dict_main, ObIFTDict *&dict_quan)
+{
+  int ret = OB_SUCCESS;
+  ObFTDictDesc main_desc("main_dict",
+                         ObFTDictType::DICT_IK_MAIN,
+                         ObCharsetType::CHARSET_UTF8MB4,
+                         ObCollationType::CS_TYPE_UTF8MB4_BIN);
+  ObFTDictDesc quan_desc("quan_dict",
+                         ObFTDictType::DICT_IK_QUAN,
+                         ObCharsetType::CHARSET_UTF8MB4,
+                         ObCollationType::CS_TYPE_UTF8MB4_BIN);
+  ObFTCacheRangeContainer *main_container = nullptr;
+  ObFTCacheRangeContainer *quan_container = nullptr;
+  ObIFTDict *main_dict = nullptr;
+  ObIFTDict *quan_dict = nullptr;
+
+  if (OB_ISNULL(main_container = OB_NEWx(ObFTCacheRangeContainer, &handler_allocator_, handler_allocator_))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+  } else if (OB_ISNULL(quan_container = OB_NEWx(ObFTCacheRangeContainer, &handler_allocator_, handler_allocator_))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+  } else if (OB_FAIL(load_or_build_cache(main_desc, *main_container))) {
+  } else if (OB_FAIL(load_or_build_cache(quan_desc, *quan_container))) {
+  } else if (OB_ISNULL(main_dict = OB_NEWx(ObFTRangeDict,
+                                           &handler_allocator_,
+                                           handler_allocator_,
+                                           main_container,
+                                           main_desc))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+  } else if (OB_FAIL(main_dict->init())) {
+  } else if (OB_ISNULL(quan_dict = OB_NEWx(ObFTRangeDict,
+                                           &handler_allocator_,
+                                           handler_allocator_,
+                                           quan_container,
+                                           quan_desc))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+  } else if (OB_FAIL(quan_dict->init())) {
+  }
+
+  if (OB_FAIL(ret)) {
+    LOG_WARN("failed to build shared ik dicts", K(ret));
+    if (OB_NOT_NULL(main_dict)) {
+      OB_DELETEx(ObIFTDict, &handler_allocator_, main_dict);
+    }
+    if (OB_NOT_NULL(quan_dict)) {
+      OB_DELETEx(ObIFTDict, &handler_allocator_, quan_dict);
+    }
+    if (OB_NOT_NULL(main_container)) {
+      OB_DELETEx(ObFTCacheRangeContainer, &handler_allocator_, main_container);
+    }
+    if (OB_NOT_NULL(quan_container)) {
+      OB_DELETEx(ObFTCacheRangeContainer, &handler_allocator_, quan_container);
+    }
+  } else {
+    ik_container_main_ = main_container;
+    ik_container_quan_ = quan_container;
+    ik_dict_main_ = main_dict;
+    ik_dict_quan_ = quan_dict;
+    dict_main = main_dict;
+    dict_quan = quan_dict;
+  }
+  return ret;
+}
+
+int ObFTParseData::load_or_build_cache(const ObFTDictDesc &desc,
+                                       ObFTCacheRangeContainer &container)
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(dict_hub_->load_cache(desc, container))) {
+    if (OB_ENTRY_NOT_EXIST == ret) {
+      ret = OB_SUCCESS;
+      if (OB_FAIL(dict_hub_->build_cache(desc, container))) {
+        LOG_WARN("failed to build dict cache", K(ret));
+      }
+    } else {
+      LOG_WARN("failed to load dict cache", K(ret));
+    }
   }
   return ret;
 }

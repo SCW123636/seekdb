@@ -19,6 +19,7 @@
 
 #include "lib/allocator/ob_fifo_allocator.h"
 #include "lib/charset/ob_charset.h"
+#include "lib/lock/ob_spin_lock.h"
 #include "lib/string/ob_string.h"
 #include "object/ob_object.h"
 #include "data_plane/fts/ob_fts_parser.h"
@@ -38,7 +39,10 @@ namespace storage
 
 class ObStopWordChecker;
 class ObFTDictHub;
+class ObFTDictDesc;
 class ObAddWord;
+class ObIFTDict;
+class ObFTCacheRangeContainer;
 
 #define FTS_BUILD_IN_PARSER_LIST                                                                   \
   FT_PARSER_TYPE(FTP_SPACE, space)                                                                 \
@@ -119,15 +123,26 @@ public:
 public:
   ObStopWordChecker *stop_word_checker() const { return stop_word_checker_; }
   int get_dict_hub(ObFTDictHub *&hub);
+  // The built-in ik dictionaries are immutable once loaded and every parser
+  // instance built the same two range dicts from the same cached DAT blocks, so
+  // keep one process wide copy and let parsers borrow it.
+  int get_ik_dicts(ObIFTDict *&dict_main, ObIFTDict *&dict_quan);
 
 private:
   int init_and_set_stopword_list();
   int init_dict_hub();
+  int build_ik_dicts(ObIFTDict *&dict_main, ObIFTDict *&dict_quan);
+  int load_or_build_cache(const ObFTDictDesc &desc, ObFTCacheRangeContainer &container);
 
 private:
   ObStopWordChecker *     stop_word_checker_ = nullptr;
   ObFTDictHub *           dict_hub_          = nullptr;
   common::ObFIFOAllocator handler_allocator_;
+  common::ObSpinLock      ik_dict_lock_;
+  ObIFTDict *             ik_dict_main_      = nullptr;
+  ObIFTDict *             ik_dict_quan_      = nullptr;
+  ObFTCacheRangeContainer *ik_container_main_ = nullptr;
+  ObFTCacheRangeContainer *ik_container_quan_ = nullptr;
   bool                    is_inited_         = false;
 };
 
