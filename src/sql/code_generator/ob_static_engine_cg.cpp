@@ -5569,6 +5569,14 @@ int ObStaticEngineCG::generate_spec(ObLogJsonTable &op, ObJsonTableSpec &spec,
   }
   if (OB_SUCC(ret)) {
     spec.table_type_ = op.get_table_type();  // table func type
+    if (!op.get_file_options().empty()) {
+      ObString tmp_file_options;
+      if (OB_FAIL(ob_write_string(alloc, op.get_file_options(), tmp_file_options))) {
+        LOG_WARN("copy file options failed", K(ret));
+      } else {
+        spec.file_options_ = tmp_file_options;
+      }
+    }
 
     if (OB_FAIL(spec.dup_origin_column_defs(op.get_origin_cols_def()))) {
     }

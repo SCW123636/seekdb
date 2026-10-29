@@ -16,6 +16,7 @@
 
 #define USING_LOG_PREFIX SQL_ENG
 #include "ob_json_table_op.h"
+#include "share/system_variable/ob_sys_var_class_type.h"
 #include "sql/engine/expr/ob_expr_multi_mode_func_helper.h"
 #include "sql/engine/expr/ob_expr_json_value.h"
 #include "sql/engine/expr/ob_expr_json_query.h"
@@ -326,8 +327,11 @@ OB_DEF_SERIALIZE(ObJsonTableSpec)
     OB_UNIS_ENCODE(info);
   }
   if (OB_FAIL(ret)) {
-  } else if (table_type_ == MulModeTableType::OB_UNNEST_TABLE_TYPE) {
+  } else {
     OB_UNIS_ENCODE(table_type_);
+    OB_UNIS_ENCODE(file_options_);
+  }
+  if (OB_SUCC(ret) && table_type_ == MulModeTableType::OB_UNNEST_TABLE_TYPE) {
     int32_t value_exprs_count = value_exprs_.count() - 1;
     OB_UNIS_ENCODE(value_exprs_count);
     for (size_t i = 1; OB_SUCC(ret) && i < value_exprs_.count(); ++i) {
@@ -354,8 +358,9 @@ OB_DEF_SERIALIZE_SIZE(ObJsonTableSpec)
     const ObJtColInfo& info = *cols_def_.at(i);
     OB_UNIS_ADD_LEN(info);
   }
+  OB_UNIS_ADD_LEN(table_type_);
+  OB_UNIS_ADD_LEN(file_options_);
   if (table_type_ == MulModeTableType::OB_UNNEST_TABLE_TYPE) {
-    OB_UNIS_ADD_LEN(table_type_);
     int32_t value_exprs_count = value_exprs_.count() - 1;
     OB_UNIS_ADD_LEN(value_exprs_count);
     for (size_t i = 1; i < value_exprs_.count(); ++i) {
@@ -377,7 +382,6 @@ OB_DEF_DESERIALIZE(ObJsonTableSpec)
   OB_UNIS_DECODE(has_correlated_expr_);
   
   int32_t column_count = 0;
-  int8_t table_type_flag = OB_JSON_TABLE;
   OB_UNIS_DECODE(column_count);
   
   if (OB_SUCC(ret) && OB_FAIL(cols_def_.init(column_count))) {
@@ -393,15 +397,25 @@ OB_DEF_DESERIALIZE(ObJsonTableSpec)
       OB_UNIS_DECODE(tmp_col_info);
       *col_info = tmp_col_info;
       if (OB_FAIL(cols_def_.push_back(col_info))) {
-      } else if (col_info->col_type_ == COL_TYPE_UNNEST) {
-        table_type_flag = OB_UNNEST_TABLE;
       }
     }
   }
 
   if (OB_FAIL(ret)) {
-  } else if (table_type_flag == OB_UNNEST_TABLE) {
+  } else {
     OB_UNIS_DECODE(table_type_);
+    OB_UNIS_DECODE(file_options_);
+    if (OB_SUCC(ret) && !file_options_.empty()) {
+      ObString tmp_file_options;
+      if (OB_FAIL(ob_write_string(*alloc_, file_options_, tmp_file_options))) {
+        LOG_WARN("copy file options failed", K(ret));
+      } else {
+        file_options_ = tmp_file_options;
+      }
+    }
+  }
+  if (OB_FAIL(ret)) {
+  } else if (table_type_ == MulModeTableType::OB_UNNEST_TABLE_TYPE) {
     int32_t value_exprs_count = 0;
     OB_UNIS_DECODE(value_exprs_count);
     if (OB_FAIL(ret)) {
@@ -585,6 +599,9 @@ int ObJsonTableOp::inner_open()
 {
   INIT_SUCC(ret);
   if (OB_FAIL(init())) {
+  } else if (is_file_scan()) {
+    if (OB_FAIL(open_file_scan())) {
+    }
   } else if (MY_SPEC.value_exprs_.empty()) {
     ret = OB_ERR_UNEXPECTED;
   } else if (OB_FAIL(root_->open(&jt_ctx_))) {
@@ -599,11 +616,18 @@ int ObJsonTableOp::inner_rescan()
 {
   int ret = OB_SUCCESS;
   if (OB_FAIL(ObOperator::inner_rescan())) {
+  } else if (is_file_scan()) {
+    jt_ctx_.row_alloc_.reuse();
+    glob_idx_ = 0;
+    if (file_reader_.is_opened() && OB_FAIL(file_reader_.rescan())) {
+    } else if (parquet_reader_.is_opened() && OB_FAIL(parquet_reader_.rescan())) {
+    } else {
+      is_evaled_ = false;
+    }
   } else {
     jt_ctx_.row_alloc_.reuse();
-  }
-  if (OB_FAIL(ret)) {
-  } else if (OB_FAIL(reset_variable())) {
+    if (OB_FAIL(reset_variable())) {
+    }
   }
   return ret;
 }
@@ -639,7 +663,17 @@ int ObJsonTableOp::init()
   if (!is_inited_) {
     const ObJsonTableSpec* spec_ptr = reinterpret_cast<const ObJsonTableSpec*>(&spec_);
     jt_ctx_.spec_ptr_ = const_cast<ObJsonTableSpec*>(spec_ptr);
-    if (OB_FAIL(generate_table_exec_tree())) {
+    if (is_file_scan()) {
+      if (OB_FAIL(init_file_scan())) {
+      } else {
+        is_inited_ = true;
+        jt_ctx_.eval_ctx_ = &eval_ctx_;
+        jt_ctx_.exec_ctx_ = &get_exec_ctx();
+        jt_ctx_.op_exec_alloc_ = allocator_;
+        jt_ctx_.jt_op_ = this;
+        jt_ctx_.is_const_input_ = !MY_SPEC.has_correlated_expr_;
+      }
+    } else if (OB_FAIL(generate_table_exec_tree())) {
     } else {
       const sql::ObSQLSessionInfo *session = get_exec_ctx().get_my_session();
       if (OB_ISNULL(session)) {
@@ -685,6 +719,8 @@ int ObJsonTableOp::init()
 int ObJsonTableOp::inner_close()
 {
   INIT_SUCC(ret);
+  file_reader_.close();
+  parquet_reader_.close();
   if (OB_NOT_NULL(root_)) {
     if (OB_FAIL(root_->reset(&jt_ctx_))) {
     }
@@ -1402,7 +1438,9 @@ int ObJsonTableOp::inner_get_next_row()
 {
   INIT_SUCC(ret);
   bool is_root_null = false;
-  if (!(jt_ctx_.is_json_table_func()
+  if (is_file_scan()) {
+    ret = inner_get_next_row_file();
+  } else if (!(jt_ctx_.is_json_table_func()
         || jt_ctx_.is_unnest_table_func())) {
     ret = OB_ERR_UNEXPECTED;
   } else if (is_evaled_) {
@@ -1424,6 +1462,294 @@ int ObJsonTableOp::inner_get_next_row()
     }
   }
 
+  return ret;
+}
+
+bool ObJsonTableOp::is_file_scan() const
+{
+  return is_file_scan_table_type(MY_SPEC.table_type_);
+}
+
+int ObJsonTableOp::init_file_scan()
+{
+  int ret = OB_SUCCESS;
+  if (file_inited_) {
+    // options are decoded once per operator
+  } else if (OB_ISNULL(get_exec_ctx().get_my_session())) {
+    ret = OB_ERR_UNEXPECTED;
+  } else {
+    // a cached plan must not run file sql after the variable was turned off
+    bool enable_file_sql = false;
+    if (OB_FAIL(get_exec_ctx().get_my_session()->get_sys_variable(
+                  share::SYS_VAR_ENABLE_FILE_SQL, enable_file_sql))) {
+      LOG_WARN("get enable_file_sql failed", K(ret));
+    } else if (!enable_file_sql) {
+      ret = OB_NOT_SUPPORTED;
+      FORWARD_USER_ERROR_MSG(ret, "file sql is disabled, set enable_file_sql = on");
+      LOG_WARN("file sql is disabled", K(ret));
+    } else if (OB_FAIL(file_opt_.decode(MY_SPEC.file_options_))) {
+      LOG_WARN("decode file options failed", K(ret));
+    } else if (OB_FILE_FORMAT_CSV == file_opt_.format_ && file_opt_.has_header_) {
+      // the header line has been consumed when the schema was inferred
+      file_opt_.skip_lines_ += 1;
+    }
+  }
+  if (OB_SUCC(ret)) {
+    file_inited_ = true;
+  }
+  return ret;
+}
+
+int ObJsonTableOp::get_file_path(ObString &path)
+{
+  int ret = OB_SUCCESS;
+  ObDatum *datum = NULL;
+  ObExpr *path_expr = NULL;
+  if (MY_SPEC.value_exprs_.empty()
+      || OB_ISNULL(path_expr = MY_SPEC.value_exprs_.at(0))) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("file table has no path expression", K(ret));
+  } else if (OB_FAIL(path_expr->eval(eval_ctx_, datum))) {
+    LOG_WARN("evaluate file path failed", K(ret));
+  } else if (OB_ISNULL(datum) || datum->is_null()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("file path is null", K(ret));
+  } else {
+    path = datum->get_string();
+    if (path.empty()) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_WARN("file path is empty", K(ret));
+    }
+  }
+  return ret;
+}
+
+int ObJsonTableOp::open_file_scan()
+{
+  int ret = OB_SUCCESS;
+  ObString path;
+  ObString canonical;
+  if (OB_FAIL(get_file_path(path))) {
+  } else if (OB_FAIL(ObFileScanUtils::canonicalize_path(*allocator_, path, canonical))) {
+    LOG_WARN("canonicalize file path failed", K(ret), K(path));
+  } else if (FALSE_IT(file_path_ = canonical)) {
+  } else if (OB_FILE_FORMAT_GLOB == file_opt_.format_) {
+    glob_paths_.reuse();
+    glob_idx_ = 0;
+    if (OB_FAIL(ObFileScanUtils::glob_paths(*allocator_, file_path_, glob_paths_))) {
+      LOG_WARN("expand glob path failed", K(ret), K(file_path_));
+    }
+  } else if (OB_FILE_FORMAT_PARQUET == file_opt_.format_) {
+    if (OB_FAIL(parquet_reader_.open(file_path_, file_opt_, *allocator_))) {
+      LOG_WARN("open parquet file failed", K(ret), K(file_path_));
+    } else if (OB_FAIL(set_parquet_projection())) {
+      LOG_WARN("set parquet projection failed", K(ret), K(file_path_));
+    }
+  } else if (OB_FAIL(file_reader_.open(file_path_, file_opt_, *allocator_, NULL))) {
+    LOG_WARN("open file failed", K(ret), K(file_path_));
+  } else if (OB_FAIL(file_reader_.check_file_unchanged())) {
+    LOG_WARN("file changed after the schema was inferred", K(ret), K(file_path_));
+  }
+  return ret;
+}
+
+int ObJsonTableOp::set_parquet_projection()
+{
+  int ret = OB_SUCCESS;
+  ObSEArray<bool, 16> needed;
+  const int64_t column_count = parquet_reader_.column_count();
+  for (int64_t i = 0; OB_SUCC(ret) && i < column_count; ++i) {
+    if (OB_FAIL(needed.push_back(false))) {
+      LOG_WARN("push projection flag failed", K(ret));
+    }
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < MY_SPEC.cols_def_.count(); ++i) {
+    const ObJtColInfo *col_info = MY_SPEC.cols_def_.at(i);
+    if (NULL != col_info && COL_TYPE_VALUE == col_info->col_type_
+        && col_info->output_column_idx_ >= 0) {
+      const int64_t file_idx = static_cast<int64_t>(col_info->id_) - 1;
+      if (file_idx >= 0 && file_idx < column_count) {
+        needed.at(file_idx) = true;
+      }
+    }
+  }
+  if (OB_SUCC(ret) && OB_FAIL(parquet_reader_.set_needed_columns(needed))) {
+    LOG_WARN("set parquet projection failed", K(ret));
+  }
+  return ret;
+}
+
+int ObJsonTableOp::inner_get_next_row_file()
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(!is_inited_)) {
+    ret = OB_NOT_INIT;
+  } else {
+    clear_evaluated_flag();
+    if (OB_FILE_FORMAT_GLOB == file_opt_.format_) {
+      if (glob_idx_ >= glob_paths_.count()) {
+        ret = OB_ITER_END;
+      } else {
+        ObSEArray<ObString, 1> fields;
+        ObSEArray<bool, 1> is_null;
+        if (OB_FAIL(fields.push_back(glob_paths_.at(glob_idx_)))
+            || OB_FAIL(is_null.push_back(false))) {
+        } else {
+          ++glob_idx_;
+          ret = fill_file_columns(fields, is_null);
+        }
+      }
+    } else if (OB_FILE_FORMAT_JSON == file_opt_.format_
+               || OB_FILE_FORMAT_NDJSON == file_opt_.format_) {
+      ObSEArray<ObString, 32> keys;
+      ObSEArray<ObString, 32> values;
+      ObSEArray<bool, 32> value_nulls;
+      ObString line;
+      bool got_record = false;
+      while (OB_SUCC(ret) && !got_record) {
+        const int tmp_ret = file_reader_.next_line(line);
+        if (OB_ITER_END == tmp_ret) {
+          ret = OB_ITER_END;
+        } else if (OB_SUCCESS != tmp_ret) {
+          ret = tmp_ret;
+          LOG_WARN("read json line failed", K(ret));
+        } else if (line.empty()) {
+          // blank line
+        } else {
+          jt_ctx_.row_alloc_.reuse();
+          if (OB_FAIL(ObFileScanUtils::parse_json_record(line, keys, values, value_nulls,
+                                                         jt_ctx_.row_alloc_))) {
+            char detail[512];
+            snprintf(detail, sizeof(detail), "invalid json object at line %ld of %.*s",
+                     static_cast<long>(file_reader_.record_no()), file_path_.length(),
+                     file_path_.ptr());
+            LOG_USER_ERROR(OB_INVALID_ARGUMENT, detail);
+            LOG_WARN("parse json record failed", K(ret), K(line));
+          } else {
+            got_record = true;
+          }
+        }
+      }
+      if (OB_SUCC(ret) && got_record) {
+        ret = fill_json_columns(keys, values, value_nulls);
+      }
+    } else if (OB_FILE_FORMAT_CSV == file_opt_.format_) {
+      ObSEArray<ObString, 32> fields;
+      ObSEArray<bool, 32> is_null;
+      const int tmp_ret = file_reader_.next_record(fields, is_null);
+      if (OB_ITER_END == tmp_ret) {
+        ret = OB_ITER_END;
+      } else if (OB_SUCCESS != tmp_ret) {
+        ret = tmp_ret;
+        LOG_WARN("read csv record failed", K(ret), K(file_reader_.record_no()));
+      } else {
+        jt_ctx_.row_alloc_.reuse();
+        ret = fill_file_columns(fields, is_null);
+      }
+    } else if (OB_FILE_FORMAT_PARQUET == file_opt_.format_) {
+      ObSEArray<ObString, 32> fields;
+      ObSEArray<bool, 32> is_null;
+      const int tmp_ret = parquet_reader_.next_row(fields, is_null);
+      if (OB_ITER_END == tmp_ret) {
+        ret = OB_ITER_END;
+      } else if (OB_SUCCESS != tmp_ret) {
+        ret = tmp_ret;
+        LOG_WARN("read parquet row failed", K(ret));
+      } else {
+        jt_ctx_.row_alloc_.reuse();
+        ret = fill_file_columns(fields, is_null);
+      }
+    } else {
+      ret = OB_NOT_SUPPORTED;
+      LOG_WARN("file format not supported", K(ret), K(file_opt_.format_));
+    }
+  }
+  return ret;
+}
+
+int ObJsonTableOp::fill_file_columns(const ObIArray<ObString> &fields,
+                                     const ObIArray<bool> &is_null)
+{
+  int ret = OB_SUCCESS;
+  for (int64_t i = 0; OB_SUCC(ret) && i < MY_SPEC.cols_def_.count(); ++i) {
+    ObJtColInfo *col_info = MY_SPEC.cols_def_.at(i);
+    ObExpr *col_expr = NULL;
+    if (OB_ISNULL(col_info)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (COL_TYPE_VALUE != col_info->col_type_ || col_info->output_column_idx_ < 0) {
+      // hidden root column, or a column the query does not reference
+    } else if (col_info->output_column_idx_ >= MY_SPEC.column_exprs_.count()
+               || OB_ISNULL(col_expr = MY_SPEC.column_exprs_.at(col_info->output_column_idx_))) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("file column expr mismatch", K(ret), K(i));
+    } else {
+      const int64_t file_idx = static_cast<int64_t>(col_info->id_) - 1;
+      ObDatum &datum = col_expr->locate_datum_for_write(eval_ctx_);
+      // locate_datum_for_write() already points ptr_ at the expr's reserved
+      // buffer; ObDatum::reset() would null it and numeric setters write
+      // through ptr_, so do not reset here.
+      if (file_idx < 0 || file_idx >= fields.count()
+          || (file_idx < is_null.count() && is_null.at(file_idx))) {
+        datum.set_null();
+      } else if (fields.at(file_idx).empty()) {
+        // an empty value stays an empty string for text columns
+        const ObObjType type = col_info->data_type_.get_obj_type();
+        if (ObVarcharType == type || ObLongTextType == type || ObCharType == type) {
+          datum.set_string(fields.at(file_idx).ptr(), 0);
+        } else {
+          datum.set_null();
+        }
+      } else if (OB_FAIL(ObFileScanUtils::text_to_datum(fields.at(file_idx),
+                                                        col_info->data_type_.get_obj_type(),
+                                                        jt_ctx_.row_alloc_, NULL, datum))) {
+        LOG_WARN("convert file value failed", K(ret), K(i), K(fields.at(file_idx)));
+      }
+      if (OB_SUCC(ret)) {
+        col_expr->get_eval_info(eval_ctx_).evaluated_ = true;
+      }
+    }
+  }
+  return ret;
+}
+
+int ObJsonTableOp::fill_json_columns(const ObIArray<ObString> &keys,
+                                     const ObIArray<ObString> &values,
+                                     const ObIArray<bool> &is_null)
+{
+  int ret = OB_SUCCESS;
+  for (int64_t i = 0; OB_SUCC(ret) && i < MY_SPEC.cols_def_.count(); ++i) {
+    ObJtColInfo *col_info = MY_SPEC.cols_def_.at(i);
+    ObExpr *col_expr = NULL;
+    if (OB_ISNULL(col_info)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (COL_TYPE_VALUE != col_info->col_type_ || col_info->output_column_idx_ < 0) {
+    } else if (col_info->output_column_idx_ >= MY_SPEC.column_exprs_.count()
+               || OB_ISNULL(col_expr = MY_SPEC.column_exprs_.at(col_info->output_column_idx_))) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("file column expr mismatch", K(ret), K(i));
+    } else {
+      int64_t idx = -1;
+      for (int64_t k = 0; k < keys.count(); ++k) {
+        if (keys.at(k).length() == col_info->col_name_.length()
+            && 0 == MEMCMP(keys.at(k).ptr(), col_info->col_name_.ptr(),
+                           col_info->col_name_.length())) {
+          idx = k;
+          break;
+        }
+      }
+      ObDatum &datum = col_expr->locate_datum_for_write(eval_ctx_);
+      if (idx < 0 || (idx < is_null.count() && is_null.at(idx))) {
+        datum.set_null();
+      } else if (OB_FAIL(ObFileScanUtils::text_to_datum(values.at(idx),
+                                                        col_info->data_type_.get_obj_type(),
+                                                        jt_ctx_.row_alloc_, NULL, datum))) {
+        LOG_WARN("convert json value failed", K(ret), K(i));
+      }
+      if (OB_SUCC(ret)) {
+        col_expr->get_eval_info(eval_ctx_).evaluated_ = true;
+      }
+    }
+  }
   return ret;
 }
 

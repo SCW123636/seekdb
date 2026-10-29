@@ -230,6 +230,23 @@ _SQL_RUNTIME_IMPLEMENTATION_DEPS = [
     "//src/sql/resolver/prepare:resolver_prepare",
 ] + _SQL_RUNTIME_NON_SHARE_DEPS
 
+# Headers reached by the file SQL unit tests (unittest/sql/...). The file scan
+# helpers and the parser entry are SQL-private, so expose only these files.
+cc_library(
+    name = "file_sql_test_headers",
+    testonly = True,
+    hdrs = [
+        "engine/basic/ob_file_scan_utils.h",
+        "engine/basic/ob_parquet_reader.h",
+    ],
+    deps = [
+        ":sql_runtime_interface",
+        ":sql_runtime_internal_headers",
+    ],
+    tags = ["manual"],
+    visibility = ["//unittest/sql:__subpackages__"],
+)
+
 # One SQL module/library with the existing release Unity translation units.
 # Standalone sources remain singleton groups, preserving compile granularity.
 grouped_unity_cc_library(

@@ -28,6 +28,8 @@
 #include "sql/engine/expr/ob_expr.h"
 #include "sql/engine/expr/ob_json_param_type.h"
 #include "sql/engine/expr/ob_expr_json_utils.h"
+#include "sql/engine/basic/ob_file_scan_utils.h"
+#include "sql/engine/basic/ob_parquet_reader.h"
 
 namespace oceanbase
 {
@@ -130,7 +132,8 @@ public:
       alloc_(&alloc),
       cols_def_(alloc),
       table_type_(MulModeTableType::OB_ORA_JSON_TABLE_TYPE),
-      namespace_def_(alloc) {}
+      namespace_def_(alloc),
+      file_options_() {}
 
   int dup_origin_column_defs(common::ObIArray<ObJtColBaseInfo*>& columns);
   int construct_tree(common::ObArray<ObMultiModeTableNode*> all_nodes, JoinNode* parent);
@@ -145,6 +148,7 @@ public:
   common::ObFixedArray<ObJtColInfo*, common::ObIAllocator> cols_def_;
   MulModeTableType table_type_;
   common::ObFixedArray<ObString, common::ObIAllocator> namespace_def_;
+  common::ObString file_options_;  // encoded options of a file scan table
 };
 
 class ObJsonTableOp;
@@ -197,7 +201,9 @@ public:
       input_(nullptr),
       j_null_(),
       j_arr_(allocator_),
-      j_obj_(allocator_)
+      j_obj_(allocator_),
+      glob_idx_(0),
+      file_inited_(false)
   {
     const ObJsonTableSpec* spec_ptr = reinterpret_cast<const ObJsonTableSpec*>(&spec);
     col_count_ = spec_ptr->column_exprs_.count();
@@ -228,6 +234,15 @@ private:
   int generate_table_exec_tree(ObIAllocator* allocator, const JtColTreeNode& orig_col,
                                JoinNode*& join_col);
   int inner_get_next_row_jt();  // json table function inner
+  bool is_file_scan() const;
+  int init_file_scan();
+  int open_file_scan();
+  int get_file_path(ObString &path);
+  int set_parquet_projection();
+  int inner_get_next_row_file();
+  int fill_file_columns(const ObIArray<ObString> &fields, const ObIArray<bool> &is_null);
+  int fill_json_columns(const ObIArray<ObString> &keys, const ObIArray<ObString> &values,
+                        const ObIArray<bool> &is_null);
 
 private:
   JtColTreeNode* def_root_;
@@ -246,6 +261,14 @@ private:
   ObJsonNull j_null_;
   ObJsonArray j_arr_;
   ObJsonObject j_obj_;
+  // file scan table function state
+  ObFileRecordReader file_reader_;
+  ObParquetReader parquet_reader_;
+  ObFileScanOptions file_opt_;
+  ObString file_path_;
+  common::ObSEArray<ObString, 8> glob_paths_;
+  int64_t glob_idx_;
+  bool file_inited_;
 };
 
 class MulModeTableFunc {

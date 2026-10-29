@@ -2282,6 +2282,7 @@ int ObLogPlan::allocate_json_table_path(JsonTablePath *json_table_path,
     } else if (OB_FAIL(op->set_column_param_default_arr(json_table_path->column_param_default_exprs_))) {
     } else {
       op->set_table_type(tbl_def->table_type_);
+      op->set_file_options(tbl_def->file_options_);
       out_access_path_op = op;
     }
   }
