@@ -39,6 +39,75 @@ namespace oceanbase
 {
 namespace sql
 {
+namespace
+{
+// (key1, key2) -> value for computations that only depend on their string inputs.
+// tokenize() rebuilds the parser's inner name and the canonical parser-properties
+// json on every call, and a session keeps passing the same pair, so remember the
+// last result on the calling thread. Only successful results are cached, so an
+// invalid input still runs the full validation and still reports the same error.
+class ObFtPureStrCache
+{
+public:
+  static const int64_t MAX_KEY1_LEN = 64;
+  static const int64_t MAX_KEY2_LEN = 512;
+  static const int64_t MAX_VAL_LEN = 1024;
+  ObFtPureStrCache() { reset(); }
+  void reset() { key1_len_ = -1; key2_len_ = 0; val_len_ = 0; }
+  bool is_match(const common::ObString &key1, const common::ObString &key2) const
+  {
+    return key1_len_ >= 0
+        && key1_len_ == key1.length()
+        && (0 == key1_len_ || 0 == MEMCMP(key1_, key1.ptr(), key1_len_))
+        && key2_len_ == key2.length()
+        && (0 == key2_len_ || 0 == MEMCMP(key2_, key2.ptr(), key2_len_));
+  }
+  void store(const common::ObString &key1, const common::ObString &key2,
+             const common::ObString &val)
+  {
+    if (key1.length() > MAX_KEY1_LEN || key2.length() > MAX_KEY2_LEN
+        || val.length() > MAX_VAL_LEN) {
+      reset();
+    } else {
+      if (key1.length() > 0) { MEMCPY(key1_, key1.ptr(), key1.length()); }
+      if (key2.length() > 0) { MEMCPY(key2_, key2.ptr(), key2.length()); }
+      if (val.length() > 0) { MEMCPY(val_, val.ptr(), val.length()); }
+      key1_len_ = key1.length();
+      key2_len_ = key2.length();
+      val_len_ = val.length();
+    }
+  }
+  common::ObString value() const { return common::ObString(val_len_, val_); }
+private:
+  int64_t key1_len_;
+  int64_t key2_len_;
+  int64_t val_len_;
+  char key1_[MAX_KEY1_LEN];
+  char key2_[MAX_KEY2_LEN];
+  char val_[MAX_VAL_LEN];
+};
+
+thread_local ObFtPureStrCache g_parser_name_cache;
+thread_local ObFtPureStrCache g_props_cache;
+
+int deep_copy_str(const common::ObString &src, common::ObIAllocator &alloc,
+                  common::ObString &dst)
+{
+  int ret = OB_SUCCESS;
+  char *buf = nullptr;
+  if (src.empty()) {
+    dst = common::ObString();
+  } else if (OB_ISNULL(buf = static_cast<char *>(alloc.alloc(src.length() + 1)))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+  } else {
+    MEMCPY(buf, src.ptr(), src.length());
+    buf[src.length()] = '\0';
+    dst = common::ObString(src.length(), buf);
+  }
+  return ret;
+}
+} // namespace
+
 ObExprTokenize::ObExprTokenize(common::ObIAllocator &alloc)
     : ObStringExprOperator(alloc,
                            T_FUN_TOKENIZE,
@@ -224,13 +293,18 @@ int ObExprTokenize::construct_ft_parser_inner_name(const ObString &input_str, To
   storage::ObFTParser parser;
 
   char *parser_name_buf = nullptr;
-  if (OB_ISNULL(parser_name_buf
+  if (g_parser_name_cache.is_match(input_str, ObString())) {
+    if (OB_FAIL(deep_copy_str(g_parser_name_cache.value(), param.allocator_, param.parser_name_))) {
+      LOG_WARN("failed to copy cached parser name", K(ret));
+    }
+  } else if (OB_ISNULL(parser_name_buf
                 = static_cast<char *>(param.allocator_.alloc(storage::OB_FT_PARSER_NAME_LENGTH)))) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
   } else if (OB_FAIL(parser.init(input_str))) {
   } else if (OB_FAIL(parser.serialize_to_str(parser_name_buf, storage::OB_FT_PARSER_NAME_LENGTH))) {
   } else {
     param.parser_name_ = ObString::make_string(parser_name_buf);
+    g_parser_name_cache.store(input_str, ObString(), param.parser_name_);
   }
   return ret;
 }
@@ -375,15 +449,26 @@ int ObExprTokenize::parse_parser_properties(const ObExpr &expr,
 int ObExprTokenize::TokenizeParam::reform_parser_properties(const ObString &properties)
 {
   int ret = OB_SUCCESS;
-  storage::ObFTParserJsonProps parser_properties;
+  // callers pass properties_ itself, which the reform below overwrites
+  const ObString input_properties = properties;
 
-  if (OB_FAIL(parser_properties.init())) {
-  } else if (OB_FAIL(parser_properties.parse_from_valid_str(properties))) {
-    LOG_USER_ERROR(OB_INVALID_ARGUMENT, "parser properties invalid.");
-  } else if (OB_FAIL(parser_properties.rebuild_props_for_ddl(parser_name_,
-                                                             ObCollationType::CS_TYPE_UTF8MB4_BIN,
-                                                             true))) {
-  } else if (OB_FAIL(parser_properties.to_format_json(allocator_, properties_))) {
+  if (g_props_cache.is_match(parser_name_, input_properties)) {
+    if (OB_FAIL(deep_copy_str(g_props_cache.value(), allocator_, properties_))) {
+      LOG_WARN("failed to copy cached parser properties", K(ret));
+    }
+  } else {
+    storage::ObFTParserJsonProps parser_properties;
+
+    if (OB_FAIL(parser_properties.init())) {
+    } else if (OB_FAIL(parser_properties.parse_from_valid_str(input_properties))) {
+      LOG_USER_ERROR(OB_INVALID_ARGUMENT, "parser properties invalid.");
+    } else if (OB_FAIL(parser_properties.rebuild_props_for_ddl(parser_name_,
+                                                               ObCollationType::CS_TYPE_UTF8MB4_BIN,
+                                                               true))) {
+    } else if (OB_FAIL(parser_properties.to_format_json(allocator_, properties_))) {
+    } else {
+      g_props_cache.store(parser_name_, input_properties, properties_);
+    }
   }
 
   return ret;
