@@ -4444,6 +4444,11 @@ int ObJsonTableDef::deep_copy(const ObJsonTableDef& src, ObIRawExprCopier &expr_
     } else if (OB_FAIL(namespace_arr_.push_back(ns_str))) {
     }
   }
+  if (OB_SUCC(ret) && !src.file_options_.empty()) {
+    if (OB_FAIL(ob_write_string(*allocator, src.file_options_, file_options_))) {
+      LOG_WARN("copy file options failed", K(ret));
+    }
+  }
 
   return ret;
 }

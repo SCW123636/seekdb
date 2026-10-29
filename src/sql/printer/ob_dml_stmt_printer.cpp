@@ -342,8 +342,27 @@ int ObDMLStmtPrinter::print_table(const TableItem *table_item,
           break;
         }
         default : {
-          ret = OB_ERR_UNEXPECTED;
-          LOG_WARN("unexpected table function type");
+          if (is_file_scan_table_type(table_item->json_table_def_->table_type_)
+              && !table_item->json_table_def_->doc_exprs_.empty()) {
+            const char *func_name = "read_csv";
+            switch (table_item->json_table_def_->table_type_) {
+              case MulModeTableType::OB_FILE_JSON_TABLE_TYPE: func_name = "read_json"; break;
+              case MulModeTableType::OB_FILE_NDJSON_TABLE_TYPE: func_name = "read_ndjson"; break;
+              case MulModeTableType::OB_FILE_PARQUET_TABLE_TYPE: func_name = "read_parquet"; break;
+              case MulModeTableType::OB_FILE_GLOB_TABLE_TYPE: func_name = "glob"; break;
+              default: func_name = "read_csv"; break;
+            }
+            ObString func_str(static_cast<int32_t>(STRLEN(func_name)), const_cast<char *>(func_name));
+            DATA_PRINTF("%.*s(", LEN_AND_PTR(func_str));
+            OZ (expr_printer_.do_print(table_item->json_table_def_->doc_exprs_.at(0), T_FROM_SCOPE));
+            DATA_PRINTF(")");
+            if (!table_item->alias_name_.empty()) {
+              DATA_PRINTF(" %.*s", LEN_AND_PTR(table_item->alias_name_));
+            }
+          } else {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("unexpected table function type");
+          }
         }
       }
       break;
